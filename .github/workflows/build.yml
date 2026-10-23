@@ -57,8 +57,8 @@ jobs:
                   applicationId 'id.cfm.webui'
                   minSdk 21
                   targetSdk 34
-                  versionCode 14
-                  versionName '3.5'
+                  versionCode 15
+                  versionName '3.5.1'
               }
 
               signingConfigs {
@@ -529,7 +529,7 @@ jobs:
            */
           public class MainActivity extends Activity {
 
-              private static final String APP_VER = "3.5";
+              private static final String APP_VER = "3.5.1";
               private static final String HOME_HOST = "192.168.43.1";
               private static final String HOME = "http://192.168.43.1/";
               private static final String NAS_HOME = "http://192.168.43.1:8088/";
@@ -5653,6 +5653,7 @@ jobs:
                   final Fit screen;
                   final TextureView tv;
                   final TextView status, titleTv, subTv, banner, reclaimBtn;
+                  final LinearLayout reclaimBar;
                   final View dotV;
                   final TextView syncChip;
                   Surface surface;
@@ -5720,12 +5721,16 @@ jobs:
                       status.setGravity(Gravity.CENTER);
                       status.setPadding(dp(24), dp(24), dp(24), dp(24));
                       screen.addView(status, new FrameLayout.LayoutParams(-1, -1));
-                      reclaimBtn = pill("Ambil layar", true, v -> reclaimScreen(dev));
-                      FrameLayout.LayoutParams rp = new FrameLayout.LayoutParams(-2, dp(40), Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM);
-                      rp.bottomMargin = dp(24);
-                      reclaimBtn.setVisibility(View.GONE);
-                      screen.addView(reclaimBtn, rp);
                       page.addView(screen, new LinearLayout.LayoutParams(-1, 0, 1));
+
+                      // Fit membentangkan semua anak non-konten sepenuh layar, jadi tombol ini ditaruh di baris sendiri di bawah layar
+                      reclaimBtn = pill("Ambil layar", true, v -> reclaimScreen(dev));
+                      reclaimBar = new LinearLayout(h);
+                      reclaimBar.setGravity(Gravity.CENTER);
+                      reclaimBar.setPadding(dp(8), dp(8), dp(8), dp(2));
+                      reclaimBar.addView(reclaimBtn);
+                      reclaimBar.setVisibility(View.GONE);
+                      page.addView(reclaimBar, new LinearLayout.LayoutParams(-1, -2));
 
                       LinearLayout nav1 = new LinearLayout(h);
                       nav1.setPadding(dp(8), dp(8), dp(8), dp(2));
@@ -5837,7 +5842,7 @@ jobs:
                           banner.setVisibility(View.GONE);
                       }
                       boolean sb = dev.state == FarmDevice.ST_LIVE && dev.standby;
-                      reclaimBtn.setVisibility(sb ? View.VISIBLE : View.GONE);
+                      reclaimBar.setVisibility(sb ? View.VISIBLE : View.GONE);
                       status.setBackgroundColor(sb ? 0xB005070B : 0x00000000);
                       switch (dev.state) {
                           case FarmDevice.ST_LIVE:
@@ -6411,7 +6416,8 @@ jobs:
                           + "berhenti). Di Android 13 ke bawah dialog izin di HP farm diterima otomatis bila bisa; bila tidak, ketuk Mulai sekarang di "
                           + "HP itu atau ketuk pemberitahuan CFM Agen. Android 8-10: centang Jangan tampilkan lagi pada dialog tangkap layar. "
                           + "Android 10 ke atas: di CFM Agen izinkan Tampil di atas aplikasi lain supaya permintaan dari jauh bisa membuka dialog "
-                          + "sendiri.\n"
+                          + "sendiri. Bila bot di HP farm menekan Kembali terus-menerus, Ambil layar mencoba ulang otomatis sampai 45 detik "
+                          + "dan layar CFM Agen mengabaikan tombol Kembali selama itu; progresnya tampil di layar kontrol.\n"
                           + "• Agar CFM dan Macrorify benar-benar jalan bersamaan, sambungkan HP farm lewat ADB (Cara 2 atau 3): jalur itu tidak "
                           + "memakai tangkap layar Android sehingga tidak bentrok.\n"
                           + "• Putar layar: putar HP farm-nya langsung, tampilan mengikuti.\n"
@@ -7540,6 +7546,8 @@ jobs:
               private static AgentServer server;
               /** Sampai kapan dialog izin tangkap layar boleh diterima otomatis oleh AgentAccess (uptimeMillis). */
               static volatile long autoAcceptUntil;
+              /** Keterangan singkat percobaan klik otomatis terakhir (ditampilkan di layar CFM Agen untuk diagnosa). */
+              static volatile String acceptDiag = "";
               static volatile String serverError = "";
 
               private AgentHost() { }
@@ -7598,6 +7606,7 @@ jobs:
 
               /** AgentService: layar kini tersedia. Klien yang siaga dilanjutkan videonya (di thread lain, tidak memblokir pemanggil). */
               static void projectionReady() {
+                  autoAcceptUntil = 0;
                   cancelReclaimNotice();
                   EVENTS.execute(() -> {
                       AgentServer s = srv();
@@ -7620,9 +7629,21 @@ jobs:
 
               /** Izinkan AgentAccess menekan tombol "Mulai sekarang" pada dialog izin tangkap layar milik kita. */
               static void armAutoAccept() {
-                  autoAcceptUntil = SystemClock.uptimeMillis() + 20000;
+                  long until = SystemClock.uptimeMillis() + 45000; // cukup untuk beberapa kali coba ulang bila dialog dibatalkan bot
+                  if (until > autoAcceptUntil) autoAcceptUntil = until;
+                  acceptDiag = "Menunggu dialog izin...";
                   AgentAccess a = AgentAccess.instance;
                   if (a != null) a.pollAccept();
+              }
+
+              /** Kabar kemajuan untuk pengendali yang sedang siaga (mis. "mencoba lagi"). Diabaikan bila layar sedang dibagikan. */
+              static void progress(final String msg) {
+                  EVENTS.execute(() -> {
+                      AgentService sv = AgentService.instance;
+                      if (sv != null && sv.hasProjection()) return;
+                      AgentServer s = srv();
+                      if (s != null) s.videoLost(msg);
+                  });
               }
 
               // ---------- AgentServer.Backend ----------
@@ -7739,6 +7760,7 @@ jobs:
                       lastReclaimAt = now;
                   }
                   armAutoAccept();
+                  progress("Membuka dialog izin tangkap layar di HP itu...");
                   try {
                       c.startActivity(reclaimIntent(c));
                   } catch (Throwable ignored) { }
@@ -8415,68 +8437,138 @@ jobs:
 
               @Override
               public void onAccessibilityEvent(AccessibilityEvent event) {
-                  if (event != null && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                          && SystemClock.uptimeMillis() < AgentHost.autoAcceptUntil) {
-                      tryAccept();
-                  }
+                  if (event == null || SystemClock.uptimeMillis() >= AgentHost.autoAcceptUntil) return;
+                  int t = event.getEventType();
+                  if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || t == AccessibilityEvent.TYPE_WINDOWS_CHANGED) tryAccept();
               }
 
-              // ---------- terima otomatis dialog izin tangkap layar (hanya saat pengendali meminta "Ambil layar") ----------
-              /** Coba terima dialog sekarang, lalu ulangi sebentar bila belum muncul. Hanya aktif selama AgentHost.autoAcceptUntil. */
+              // ---------- terima otomatis dialog izin tangkap layar (hanya saat "Ambil layar" diminta) ----------
+              private int acceptTries;
+              private long lastClickAt, lastSeenAt;
+
+              /** Mulai memantau dialog izin tangkap layar. Aktif selama AgentHost.autoAcceptUntil. */
               void pollAccept() {
-                  if (Build.VERSION.SDK_INT > 33) return; // Android 14+: dialognya berbeda dan sengaja tidak disentuh
+                  if (Build.VERSION.SDK_INT > 33) {
+                      AgentHost.acceptDiag = "Android 14+: ketuk Mulai sekarang sendiri di HP ini";
+                      return;
+                  }
+                  main.removeCallbacks(acceptPoll);
                   main.post(acceptPoll);
               }
 
               private final Runnable acceptPoll = new Runnable() {
                   @Override
                   public void run() {
-                      main.removeCallbacks(this);
                       if (SystemClock.uptimeMillis() >= AgentHost.autoAcceptUntil) return;
-                      if (!tryAccept()) main.postDelayed(this, 400);
+                      tryAccept();
+                      main.postDelayed(this, 150); // cepat: dialog bisa dibatalkan bot yang menekan Kembali
                   }
               };
 
+              private AccessibilityNodeInfo clickableSelfOrParent(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo c = n;
+                  for (int i = 0; i < 3 && c != null; i++) {
+                      if (c.isClickable()) return c;
+                      c = c.getParent();
+                  }
+                  return null;
+              }
+
+              /** Cari tombol "Mulai sekarang" pada dialog izin tangkap layar milik aplikasi ini di dalam satu jendela. */
+              private AccessibilityNodeInfo findAcceptButton(AccessibilityNodeInfo root, String own, String label) {
+                  CharSequence pkg = root.getPackageName();
+                  if (pkg == null || own.contentEquals(pkg)) return null; // jendela kita sendiri tidak disentuh
+                  java.util.List<AccessibilityNodeInfo> mine = root.findAccessibilityNodeInfosByText(label);
+                  if (mine == null || mine.isEmpty()) return null; // dialog selalu menyebut nama aplikasi yang meminta
+                  String[] words = {"Mulai sekarang", "Start now", "Mulai", "Start"};
+                  for (String w : words) {
+                      java.util.List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(w);
+                      if (l == null) continue;
+                      for (AccessibilityNodeInfo n : l) {
+                          CharSequence t = n.getText();
+                          if (t == null || !w.equalsIgnoreCase(t.toString().trim())) continue;
+                          AccessibilityNodeInfo c = clickableSelfOrParent(n);
+                          if (c != null && c.isEnabled()) return c;
+                      }
+                  }
+                  return null;
+              }
+
+              private void tapAt(float x, float y) {
+                  if (Build.VERSION.SDK_INT < 24) return;
+                  try {
+                      Path p = new Path();
+                      p.moveTo(x, y);
+                      dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(p, 0, 60)).build(), null, null);
+                  } catch (Throwable ignored) { }
+              }
+
               /**
                * Tekan "Mulai sekarang" pada dialog izin tangkap layar milik sistem. Hanya Android 13 ke bawah (Android 14
-               * memakai dialog pilihan "satu aplikasi / seluruh layar" yang sengaja tidak disentuh), dan hanya jendela
-               * com.android.systemui yang menyebut nama aplikasi ini. Kotak "Jangan tampilkan lagi" tidak pernah dicentang otomatis.
+               * memakai dialog pilihan yang sengaja tidak disentuh). Semua jendela diperiksa (bukan hanya yang aktif, karena
+               * lapisan aplikasi lain seperti Macrorify bisa menjadi jendela aktif). Klik pertama lewat aksi aksesibilitas; bila
+               * dialog tetap ada, bergantian dengan ketukan gestur. Kotak "Jangan tampilkan lagi" tidak pernah dicentang otomatis.
                */
-              private boolean tryAccept() {
-                  if (Build.VERSION.SDK_INT > 33) return false;
-                  AccessibilityNodeInfo root = null;
+              private void tryAccept() {
+                  if (Build.VERSION.SDK_INT > 33) return;
+                  String label, own;
                   try {
-                      root = getRootInActiveWindow();
-                      if (root == null) return false;
-                      CharSequence pkg = root.getPackageName();
-                      if (pkg == null || !"com.android.systemui".contentEquals(pkg)) return false;
-                      // pastikan ini dialog milik aplikasi kita: teks dialog selalu menyebut nama aplikasi yang meminta
-                      String label = getApplicationInfo().loadLabel(getPackageManager()).toString();
-                      java.util.List<AccessibilityNodeInfo> mine = root.findAccessibilityNodeInfosByText(label);
-                      if (mine == null || mine.isEmpty()) return false;
-                      AccessibilityNodeInfo btn = null;
-                      String[] words = {"Mulai sekarang", "Start now", "Mulai", "Start"};
-                      for (String w : words) {
-                          java.util.List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(w);
-                          if (l == null) continue;
-                          for (AccessibilityNodeInfo n : l) {
-                              CharSequence t = n.getText();
-                              if (n.isClickable() && t != null && w.equalsIgnoreCase(t.toString().trim())) {
-                                  btn = n;
+                      label = getApplicationInfo().loadLabel(getPackageManager()).toString();
+                      own = getPackageName();
+                  } catch (Throwable e) {
+                      return;
+                  }
+                  int wins = 0;
+                  AccessibilityNodeInfo hit = null;
+                  try {
+                      java.util.List<android.view.accessibility.AccessibilityWindowInfo> ws = null;
+                      try { ws = getWindows(); } catch (Throwable ignored) { }
+                      if (ws != null) {
+                          for (android.view.accessibility.AccessibilityWindowInfo w : ws) {
+                              wins++;
+                              AccessibilityNodeInfo r = null;
+                              try { r = w.getRoot(); } catch (Throwable ignored) { }
+                              if (r == null) continue;
+                              AccessibilityNodeInfo b = findAcceptButton(r, own, label);
+                              if (b != null) {
+                                  hit = b;
                                   break;
                               }
+                              try { r.recycle(); } catch (Throwable ignored) { }
                           }
-                          if (btn != null) break;
                       }
-                      if (btn == null || !btn.isEnabled()) return false;
-                      boolean ok = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                      if (ok) AgentHost.autoAcceptUntil = 0;
-                      return ok;
+                      if (hit == null && wins == 0) { // cadangan bila daftar jendela tidak tersedia
+                          AccessibilityNodeInfo r = getRootInActiveWindow();
+                          if (r != null) {
+                              wins = 1;
+                              hit = findAcceptButton(r, own, label);
+                          }
+                      }
                   } catch (Throwable e) {
-                      return false;
-                  } finally {
-                      try { if (root != null) root.recycle(); } catch (Throwable ignored) { }
+                      AgentHost.acceptDiag = "Gagal membaca jendela: " + e.getClass().getSimpleName();
+                      return;
                   }
+                  long now = SystemClock.uptimeMillis();
+                  if (hit == null) {
+                      if (now - lastSeenAt > 2000) acceptTries = 0;
+                      AgentHost.acceptDiag = "Menunggu dialog izin (" + wins + " jendela terbaca)";
+                      return;
+                  }
+                  lastSeenAt = now;
+                  if (now - lastClickAt < 450) return;
+                  lastClickAt = now;
+                  boolean byGesture = acceptTries % 2 == 1;
+                  acceptTries++;
+                  try {
+                      if (!byGesture) {
+                          hit.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                      } else {
+                          android.graphics.Rect r = new android.graphics.Rect();
+                          hit.getBoundsInScreen(r);
+                          tapAt(r.exactCenterX(), r.exactCenterY());
+                      }
+                  } catch (Throwable ignored) { }
+                  AgentHost.acceptDiag = "Dialog izin ditemukan, klik ke-" + acceptTries + (byGesture ? " (ketukan)" : " (aksi)");
               }
 
               @Override
@@ -8671,6 +8763,7 @@ jobs:
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.SystemClock;
           import android.provider.Settings;
           import android.text.InputType;
           import android.util.TypedValue;
@@ -8700,7 +8793,9 @@ jobs:
               private TextView accessState, accessNote, shareState, addrTv, pinTv, clientTv, errTv;
               private TextView accessBtn, shareBtn, stopBtn, serverTv;
               private boolean reclaimMode, capturePending, resumed, wantCapture;
-              private TextView overlayNote, overlayBtn;
+              private TextView overlayNote, overlayBtn, diagTv;
+              private int attempts;
+              private long reclaimDeadline;
 
               private final Runnable tick = new Runnable() {
                   @Override
@@ -8805,6 +8900,8 @@ jobs:
                   add(c2, stopBtn, 8);
                   errTv = tv("", 12.5f, MainActivity.BAD, false);
                   add(c2, errTv, 8);
+                  diagTv = tv("", 11.5f, MainActivity.DIM, false);
+                  add(c2, diagTv, 6);
                   add(root, c2, 12);
 
                   // sambungan
@@ -8847,6 +8944,8 @@ jobs:
                           + "mengetik tetap jalan, dan pesan alasannya tampil di pengendali. Tombol Ambil layar di pengendali (atau di "
                           + "pemberitahuan HP ini) merebut layar kembali, tetapi itu mengambilnya dari Macrorify, jadi Macrorify bisa berhenti "
                           + "melihat layar.\n\n"
+                          + "Bila bot menekan Kembali terus-menerus, permintaan Ambil layar dicoba ulang otomatis sampai 45 detik dan layar ini "
+                          + "mengabaikan tombol Kembali selama itu.\n\n"
                           + "Agar keduanya benar-benar berjalan bersamaan, HP farm perlu disambung lewat ADB WiFi (mode ADB di Phone Farm); "
                           + "jalur itu tidak memakai tangkap layar ini.", 12.5f, MainActivity.DIM, false);
                   add(c5, d5, 4);
@@ -8903,8 +9002,17 @@ jobs:
                   }
                   reclaimMode = true;
                   wantCapture = true;
+                  attempts = 0;
+                  reclaimDeadline = SystemClock.uptimeMillis() + 45000;
                   AgentHost.armAutoAccept();
                   if (resumed) ui.post(this::runWanted);
+              }
+
+              /** Selama mode ambil-layar, tombol Kembali (mis. dari bot Macrorify) tidak boleh menutup layar ini sebelum dialog izin selesai. */
+              @Override
+              public void onBackPressed() {
+                  if (reclaimMode) return;
+                  super.onBackPressed();
               }
 
               /** Minta izin tangkap layar yang tertunda (setelah layar benar-benar tampil di depan). */
@@ -8974,6 +9082,10 @@ jobs:
                   shareBtn.setBackground(live ? box(MainActivity.CARD2, 14, MainActivity.LINE) : box(MainActivity.ACC, 14, 0));
                   shareBtn.setTextColor(live ? MainActivity.FG : 0xFF0B0E14);
                   stopBtn.setVisibility(standby ? View.VISIBLE : View.GONE);
+                  String dg = AgentHost.acceptDiag;
+                  boolean showDiag = Build.VERSION.SDK_INT <= 33 && !live && dg != null && !dg.isEmpty();
+                  diagTv.setText(showDiag ? "Klik otomatis dialog izin: " + dg : "");
+                  diagTv.setVisibility(showDiag ? View.VISIBLE : View.GONE);
                   if (overlayNote != null) {
                       boolean ov = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this);
                       overlayNote.setText(ov ? "✓ Diizinkan" : "○ Belum diizinkan");
@@ -9075,6 +9187,7 @@ jobs:
                   }
                   try {
                       capturePending = true;
+                      AgentHost.armAutoAccept();
                       startActivityForResult(m.createScreenCaptureIntent(), REQ_PROJ);
                   } catch (Throwable e) {
                       capturePending = false;
@@ -9095,6 +9208,16 @@ jobs:
                   if (res != RESULT_OK || data == null) {
                       Toast.makeText(this, "Izin tangkap layar dibatalkan", Toast.LENGTH_LONG).show();
                       if (reclaimMode) {
+                          if (SystemClock.uptimeMillis() < reclaimDeadline && attempts < 12) {
+                              // dialog dibatalkan di tengah jalan (mis. bot menekan Kembali): coba lagi sampai batas waktu
+                              attempts++;
+                              AgentService.lastError = "Dialog izin dibatalkan di HP itu (mungkin tertekan Kembali oleh bot). Mencoba lagi (" + attempts + ")";
+                              AgentHost.progress(AgentService.lastError);
+                              wantCapture = true;
+                              AgentHost.armAutoAccept();
+                              if (resumed) ui.postDelayed(this::runWanted, 250);
+                              return;
+                          }
                           AgentService.lastError = "Permintaan ambil layar dibatalkan di HP itu";
                           AgentHost.cancelReclaimNotice();
                           AgentHost.projectionLost(AgentService.lastError);
@@ -9144,9 +9267,9 @@ jobs:
           cat > app/src/main/res/xml/agent_access.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagDefault"
+              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
               android:canPerformGestures="true"
               android:canRetrieveWindowContent="true"
               android:description="@string/agent_access_desc"

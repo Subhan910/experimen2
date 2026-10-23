@@ -57,8 +57,8 @@ jobs:
                   applicationId 'id.cfm.webui'
                   minSdk 21
                   targetSdk 34
-                  versionCode 12
-                  versionName '3.3'
+                  versionCode 13
+                  versionName '3.4'
               }
 
               signingConfigs {
@@ -89,6 +89,10 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
               <application
@@ -109,6 +113,37 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <!-- Mode Agen: dipasang di HP farm supaya bisa dikontrol dari HP pengendali tanpa ADB -->
+                  <activity
+                      android:name=".AgentActivity"
+                      android:label="CFM Agen"
+                      android:icon="@drawable/ic_launcher"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density|fontScale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AgentService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".AgentAccess"
+                      android:label="CFM Agen"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/agent_access" />
+                  </service>
               </application>
           </manifest>
           EOF_FILE
@@ -492,7 +527,7 @@ jobs:
            */
           public class MainActivity extends Activity {
 
-              private static final String APP_VER = "3.3";
+              private static final String APP_VER = "3.4";
               private static final String HOME_HOST = "192.168.43.1";
               private static final String HOME = "http://192.168.43.1/";
               private static final String NAS_HOME = "http://192.168.43.1:8088/";
@@ -3722,6 +3757,7 @@ jobs:
           </body>
           </html>
           EOF_FILE
+          mkdir -p app/src/main/res/xml
           cat > app/src/main/java/id/cfm/webui/FarmDevice.java <<'EOF_FILE'
           package id.cfm.webui;
 
@@ -3734,7 +3770,11 @@ jobs:
           import dadb.AdbKeyPair;
           import dadb.AdbStream;
           import dadb.Dadb;
+          import java.io.BufferedInputStream;
+          import java.io.BufferedOutputStream;
           import java.io.ByteArrayOutputStream;
+          import java.io.DataInputStream;
+          import java.io.DataOutputStream;
           import java.io.EOFException;
           import java.io.File;
           import java.io.FileInputStream;
@@ -3744,6 +3784,7 @@ jobs:
           import java.math.BigInteger;
           import java.net.InetSocketAddress;
           import java.net.Socket;
+          import java.net.SocketException;
           import java.net.SocketTimeoutException;
           import java.nio.ByteBuffer;
           import java.nio.ByteOrder;
@@ -3774,6 +3815,9 @@ jobs:
            * Satu HP di phone farm. Terhubung lewat ADB WiFi (library dadb, tanpa server adb di HP ini),
            * lalu menjalankan scrcpy-server di HP target dan memutar aliran H.264-nya dengan MediaCodec.
            * Sentuhan dan tombol dikirim lewat saluran kontrol scrcpy.
+           *
+           * Perangkat bisa juga berjenis "Agen" (agent = true): HP itu menjalankan aplikasi ini dalam Mode Agen dan
+           * disambung lewat TCP port 5600 dengan PIN, tanpa ADB sama sekali (lihat AgentWire).
            *
            * Mode "headless" (surface == null): aliran video dibuang tanpa didekode, hanya saluran kontrol
            * yang aktif. Dipakai agar HP lain tetap menerima perintah saat mode sinkron.
@@ -3996,6 +4040,11 @@ jobs:
               // ---------- data per perangkat ----------
               final String host;
               final int port;
+              /** true = HP farm menjalankan Mode Agen (tanpa ADB). */
+              final boolean agent;
+              final String pin;
+              /** Agen terhubung tetapi layanan Aksesibilitasnya belum aktif: layar tampil, sentuhan tidak jalan. */
+              volatile boolean noControl;
               volatile String name;
               volatile String model = "";
               volatile int state = ST_IDLE;
@@ -4012,9 +4061,15 @@ jobs:
               private volatile Run run;
 
               FarmDevice(String name, String host, int port, Listener l) {
+                  this(name, host, port, false, "", l);
+              }
+
+              FarmDevice(String name, String host, int port, boolean agent, String pin, Listener l) {
                   this.name = name == null ? "" : name;
                   this.host = host;
                   this.port = port;
+                  this.agent = agent;
+                  this.pin = pin == null ? "" : pin;
                   this.listener = l;
               }
 
@@ -4131,6 +4186,8 @@ jobs:
                   touching = false;
                   String m = e.getMessage();
                   if (e instanceof EOFException || m == null || m.isEmpty()) m = "Koneksi terputus";
+                  if (agent && e instanceof SocketTimeoutException) m = "Agen tidak merespons (WiFi putus?)";
+                  else if (agent && e instanceof SocketException) m = "Koneksi ke Agen terputus";
                   set(ST_ERROR, m);
               }
 
@@ -4191,6 +4248,10 @@ jobs:
 
               /** Jalankan perintah shell di HP ini (thread latar). cb dipanggil di thread latar. */
               void exec(final String cmd, final Result cb) {
+                  if (agent) {
+                      if (cb != null) cb.done(this, "", "Mode Agen tidak mendukung perintah shell");
+                      return;
+                  }
                   POOL.execute(() -> {
                       String out = "", err = null;
                       AdbStream s = null;
@@ -4223,6 +4284,10 @@ jobs:
                   if (action == ACT_DOWN) touching = true;
                   else if (!touching) return; // jangan kirim MOVE/UP tanpa DOWN
                   if (action == ACT_UP) touching = false;
+                  if (agent) {
+                      r.send(AgentWire.touchMsg(action, nx, ny), action == ACT_MOVE);
+                      return;
+                  }
                   int x = Math.max(0, Math.min(w - 1, Math.round(nx * w)));
                   int y = Math.max(0, Math.min(h - 1, Math.round(ny * h)));
                   r.send(touchMsg(action, x, y, w, h), action == ACT_MOVE);
@@ -4231,9 +4296,13 @@ jobs:
               void key(int code) {
                   Run r = run;
                   if (r != null && state == ST_LIVE) {
-                      r.send(keyMsg(0, code), false);
-                      r.send(keyMsg(1, code), false);
-                  } else {
+                      if (agent) {
+                          r.send(AgentWire.keyMsg(code), false);
+                      } else {
+                          r.send(keyMsg(0, code), false);
+                          r.send(keyMsg(1, code), false);
+                      }
+                  } else if (!agent) {
                       exec("input keyevent " + code, null);
                   }
               }
@@ -4241,12 +4310,14 @@ jobs:
               boolean text(String s) {
                   Run r = run;
                   if (r == null || state != ST_LIVE) return false;
-                  // batas scrcpy 300 byte per pesan: potong per 70 karakter
+                  // batas scrcpy 300 byte per pesan: potong per 70 karakter. Agen mengganti isi kolom per pesan, jadi dipecah besar
+                  int chunk = agent ? 1000 : 70;
                   int i = 0;
                   while (i < s.length()) {
-                      int end = Math.min(s.length(), i + 70);
+                      int end = Math.min(s.length(), i + chunk);
                       if (end < s.length() && Character.isHighSurrogate(s.charAt(end - 1))) end--;
-                      r.send(textMsg(s.substring(i, end)), false);
+                      String part = s.substring(i, end);
+                      r.send(agent ? AgentWire.textMsg(part) : textMsg(part), false);
                       i = end;
                   }
                   return true;
@@ -4254,7 +4325,7 @@ jobs:
 
               boolean rotate() {
                   Run r = run;
-                  if (r == null || state != ST_LIVE) return false;
+                  if (r == null || state != ST_LIVE || agent) return false; // Agen tidak bisa memutar layar: putar HP-nya
                   r.send(simpleMsg(11), false);
                   return true;
               }
@@ -4273,6 +4344,7 @@ jobs:
                   volatile boolean shellDone;
                   Run prev;
                   AdbStream shell, video, control;
+                  volatile Socket sock;
                   MediaCodec codec;
                   boolean gotConfig;
                   int cw, ch; // ukuran saat decoder dikonfigurasi
@@ -4313,8 +4385,16 @@ jobs:
                       closeQuiet(video);
                       closeQuiet(control);
                       closeQuiet(shell);
+                      closeSock();
                       alive.remove(this);
                       done.countDown();
+                  }
+
+                  void closeSock() {
+                      Socket k = sock;
+                      if (k != null) {
+                          try { k.close(); } catch (Throwable ignored) { }
+                      }
                   }
 
                   void closeQuiet(AdbStream s) {
@@ -4416,6 +4496,10 @@ jobs:
                               try { p.done.await(4, TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
                           }
                           if (!alive()) return;
+                          if (agent) {
+                              runAgent();
+                              return;
+                          }
 
                           Dadb d = ensureAdb();
                           if (!alive()) return;
@@ -4478,7 +4562,22 @@ jobs:
 
                           startControlThreads();
                           set(ST_LIVE, "");
-                          decodeLoop(vs);
+                          decodeLoop(new Frames() {
+                              @Override
+                              public long readLong() throws IOException {
+                                  return vs.readLong();
+                              }
+
+                              @Override
+                              public int readInt() throws IOException {
+                                  return vs.readInt();
+                              }
+
+                              @Override
+                              public void readFully(byte[] b) throws IOException {
+                                  vs.readFully(b);
+                              }
+                          });
                       } catch (Throwable e) {
                           if (alive()) fail(this, e);
                       } finally {
@@ -4515,13 +4614,80 @@ jobs:
                       rd.start();
                   }
 
-                  void decodeLoop(BufferedSource vs) throws IOException {
+                  /** Sisi agen: sambungan TCP, jabat tangan PIN, lalu aliran video yang sama dengan scrcpy. */
+                  void runAgent() throws Exception {
+                      Socket s = new Socket();
+                      sock = s;
+                      if (dead) throw new IOException("dibatalkan");
+                      s.setTcpNoDelay(true);
+                      try {
+                          s.connect(new InetSocketAddress(host, port), 4000);
+                      } catch (SocketTimeoutException e) {
+                          throw new IOException("Tidak terjangkau di jaringan");
+                      } catch (IOException e) {
+                          String m = String.valueOf(e.getMessage());
+                          if (m.contains("refused")) throw new IOException("Agen belum aktif di HP itu. Buka CFM Agen di HP itu lalu ketuk Mulai");
+                          throw e;
+                      }
+                      s.setSoTimeout(12000);
+                      final DataInputStream din = new DataInputStream(new BufferedInputStream(s.getInputStream(), 65536));
+                      DataOutputStream dout = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 1024));
+                      AgentWire.Hello hl = AgentWire.clientHello(din, dout, pin, prof.maxSize, prof.bitrate, prof.fps);
+                      if (!alive()) return;
+                      if (model.isEmpty() && !hl.name.isEmpty()) {
+                          model = hl.name;
+                          listener.onChanged(FarmDevice.this);
+                      }
+                      noControl = !hl.control;
+                      vw = hl.width;
+                      vh = hl.height;
+                      initCodec(hl.width, hl.height);
+                      startAgentControl(dout);
+                      set(ST_LIVE, "");
+                      decodeLoop(new Frames() {
+                          @Override
+                          public long readLong() throws IOException {
+                              return din.readLong();
+                          }
+
+                          @Override
+                          public int readInt() throws IOException {
+                              return din.readInt();
+                          }
+
+                          @Override
+                          public void readFully(byte[] b) throws IOException {
+                              din.readFully(b);
+                          }
+                      });
+                  }
+
+                  void startAgentControl(final DataOutputStream dout) {
+                      Thread wr = new Thread(() -> {
+                          try {
+                              while (!dead) {
+                                  byte[] m = out.poll(2500, TimeUnit.MILLISECONDS);
+                                  if (m == POISON) break;
+                                  if (m == null) m = AgentWire.simpleMsg(AgentWire.C_PING); // agen memutus bila kita diam terlalu lama
+                                  dout.write(m);
+                                  dout.flush();
+                              }
+                          } catch (Throwable e) {
+                              if (!dead) closeSock(); // tulis gagal: biarkan pembaca video ikut gagal dan melaporkan
+                          }
+                      }, "farm-actl-" + host);
+                      wr.setDaemon(true);
+                      wr.start();
+                  }
+
+                  void decodeLoop(Frames vs) throws IOException {
                       MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
                       long lastReset = 0;
                       while (alive()) {
                           long pf = vs.readLong();
                           int size = vs.readInt();
                           if (size < 0 || size > 16 * 1024 * 1024) throw new IOException("Paket video rusak");
+                          if (size == 0) continue; // detak jantung dari Agen
                           byte[] data = new byte[size];
                           vs.readFully(data);
                           boolean cfg = (pf & (1L << 63)) != 0;
@@ -4564,7 +4730,8 @@ jobs:
                                   long now = System.currentTimeMillis();
                                   if (now - lastReset > 4000) {
                                       lastReset = now;
-                                      send(simpleMsg(17), false); // RESET_VIDEO
+                                      // RESET_VIDEO (scrcpy) atau SYNC (Agen): minta keyframe baru
+                                      send(agent ? AgentWire.simpleMsg(AgentWire.C_SYNC) : simpleMsg(17), false);
                                   }
                               }
                               int oi = c.dequeueOutputBuffer(info, cfg ? 0 : 20000);
@@ -4578,6 +4745,15 @@ jobs:
                           }
                       }
                   }
+              }
+
+              /** Sumber paket video: dari AdbStream (scrcpy) atau dari soket TCP (Agen). */
+              private interface Frames {
+                  long readLong() throws IOException;
+
+                  int readInt() throws IOException;
+
+                  void readFully(byte[] b) throws IOException;
               }
 
               private static String lastLine(String t) {
@@ -4991,7 +5167,7 @@ jobs:
                       else if (d.state == FarmDevice.ST_ERROR) err++;
                   }
                   if (scanning) {
-                      summaryTv.setText("Memindai jaringan untuk ADB WiFi (port 5555)... " + scanDone + "/" + scanTotal);
+                      summaryTv.setText("Memindai jaringan (ADB 5555 · Agen 5600)... " + scanDone + "/" + scanTotal);
                   } else if (devs.isEmpty()) {
                       summaryTv.setText("Belum ada HP");
                   } else {
@@ -5010,7 +5186,8 @@ jobs:
                           JSONObject o = a.getJSONObject(i);
                           String host = o.optString("h", "");
                           if (host.isEmpty()) continue;
-                          devs.add(new FarmDevice(o.optString("n", ""), host, o.optInt("p", 5555), this));
+                          boolean ag = o.optBoolean("a", false);
+                          devs.add(new FarmDevice(o.optString("n", ""), host, o.optInt("p", ag ? AgentWire.PORT : 5555), ag, o.optString("k", ""), this));
                       }
                   } catch (Exception ignored) { }
               }
@@ -5023,6 +5200,10 @@ jobs:
                           o.put("n", d.name == null ? "" : d.name);
                           o.put("h", d.host);
                           o.put("p", d.port);
+                          if (d.agent) {
+                              o.put("a", true);
+                              o.put("k", d.pin);
+                          }
                           a.put(o);
                       }
                   } catch (Exception ignored) { }
@@ -5112,19 +5293,20 @@ jobs:
                   TextView t = h.text("Belum ada HP", 17, MainActivity.FG, true);
                   t.setPadding(0, dp(12), 0, dp(6));
                   c.addView(t);
-                  TextView s = h.text("Colok HP farm ke HP ini dengan kabel OTG lalu ketuk Via USB: ADB WiFi diaktifkan otomatis, "
-                          + "tanpa PC dan tanpa root. Layar semua HP lalu tampil di sini dan bisa disentuh langsung.", 13.5f, MainActivity.DIM, false);
+                  TextView s = h.text("Tanpa PC dan tanpa OTG: pasang aplikasi ini juga di HP farm, buka ikon CFM Agen, aktifkan "
+                          + "Aksesibilitas lalu ketuk Mulai. Setelah itu ketuk Pindai WiFi di sini, masukkan PIN, dan layar semua HP "
+                          + "tampil dan bisa disentuh.", 13.5f, MainActivity.DIM, false);
                   s.setGravity(Gravity.CENTER);
                   s.setLineSpacing(0f, 1.2f);
                   c.addView(s);
                   LinearLayout b = new LinearLayout(h);
                   b.setPadding(0, dp(16), 0, 0);
-                  b.addView(pill("Via USB (tanpa PC)", true, v -> usbSetup()));
-                  b.addView(pill("Pindai WiFi", false, v -> scan()));
+                  b.addView(pill("Pindai WiFi", true, v -> scan()));
+                  b.addView(pill("Panduan", false, v -> guide()));
                   c.addView(b);
                   LinearLayout b2 = new LinearLayout(h);
                   b2.addView(pill("Tambah manual", false, v -> addDialog()));
-                  b2.addView(pill("Panduan", false, v -> guide()));
+                  b2.addView(pill("Via USB (OTG)", false, v -> usbSetup()));
                   c.addView(b2);
                   LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
                   p.setMargins(dp(6), dp(10), dp(6), 0);
@@ -5312,7 +5494,7 @@ jobs:
 
                   void refresh() {
                       nameTv.setText(dev.label());
-                      hostTv.setText(dev.host + (dev.port != 5555 ? ":" + dev.port : ""));
+                      hostTv.setText(dev.host + (dev.agent ? " · Agen" : (dev.port != 5555 ? ":" + dev.port : "")));
                       dotV.setBackground(dot(stateColor(dev.state)));
                       if (dev.vw > 0 && dev.vh > 0) screen.setRatio(dev.vw / (float) dev.vh);
                       switch (dev.state) {
@@ -5412,6 +5594,7 @@ jobs:
                   final TextView syncChip;
                   Surface surface;
                   int retries;
+                  boolean warnedNoControl;
                   final Runnable retry = new Runnable() {
                       @Override
                       public void run() {
@@ -5488,7 +5671,8 @@ jobs:
                       nav2.addView(nav(R.drawable.ic_vol, "Vol −", 46, () -> sendKey(dev, FarmDevice.KEY_VOL_DOWN)));
                       nav2.addView(nav(R.drawable.ic_vol, "Vol +", 46, () -> sendKey(dev, FarmDevice.KEY_VOL_UP)));
                       nav2.addView(nav(R.drawable.ic_refresh, "Putar", 46, () -> {
-                          dev.rotate();
+                          if (dev.agent) h.toast("Mode Agen: putar HP-nya langsung, layar mengikuti otomatis");
+                          else dev.rotate();
                           if (sync) for (FarmDevice x : devs) if (x != dev) x.rotate();
                       }));
                       nav2.addView(nav(R.drawable.ic_keyboard, "Teks", 46, () -> textDialog(dev)));
@@ -5520,6 +5704,10 @@ jobs:
                       else if (a == MotionEvent.ACTION_MOVE) act = FarmDevice.ACT_MOVE;
                       else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) act = FarmDevice.ACT_UP;
                       else return true; // abaikan jari kedua
+                      if (act == FarmDevice.ACT_DOWN && dev.noControl && !warnedNoControl) {
+                          warnedNoControl = true;
+                          h.toastL("Sentuhan belum aktif di " + dev.label() + ". Di HP itu aktifkan Aksesibilitas CFM Agen, lalu sambungkan ulang.");
+                      }
                       float w = v.getWidth(), hh = v.getHeight();
                       if (w <= 0 || hh <= 0) return true;
                       sendTouch(dev, act, clamp01(e.getX() / w), clamp01(e.getY() / hh));
@@ -5615,6 +5803,16 @@ jobs:
               private void addDialog() {
                   LinearLayout box = new LinearLayout(h);
                   box.setOrientation(LinearLayout.VERTICAL);
+                  final boolean[] agentMode = {false};
+                  LinearLayout modes = new LinearLayout(h);
+                  modes.setPadding(0, 0, 0, dp(8));
+                  final TextView mAdb = pill("ADB (5555)", false, null);
+                  final TextView mAgent = pill("Agen (5600)", false, null);
+                  pillOn(mAdb, true);
+                  pillOn(mAgent, false);
+                  modes.addView(mAdb);
+                  modes.addView(mAgent);
+                  box.addView(modes);
                   final EditText ip = h.edit("IP, mis. 192.168.43.101 atau 192.168.43.101-110");
                   ip.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
                   ip.setMinLines(2);
@@ -5623,24 +5821,49 @@ jobs:
                   final EditText pt = h.edit("Port");
                   pt.setInputType(InputType.TYPE_CLASS_NUMBER);
                   pt.setText("5555");
+                  final EditText pin = h.edit("PIN Agen (tampil di layar CFM Agen)");
+                  pin.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  pin.setText(prefs.getString("pin", ""));
+                  pin.setVisibility(View.GONE);
                   box.addView(ip);
                   LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(-1, -2);
                   p2.setMargins(0, dp(8), 0, 0);
                   box.addView(nm, p2);
                   box.addView(pt, p2);
-                  TextView hint = h.text("Pisahkan beberapa alamat dengan koma, spasi, atau baris baru. Rentang 101-110 menambah 10 HP sekaligus.",
+                  box.addView(pin, p2);
+                  final TextView hint = h.text("Pisahkan beberapa alamat dengan koma, spasi, atau baris baru. Rentang 101-110 menambah 10 HP sekaligus.",
                           11.5f, MainActivity.DIM, false);
                   hint.setPadding(0, dp(8), 0, 0);
                   box.addView(hint);
+                  View.OnClickListener pick = v -> {
+                      boolean ag = v == mAgent;
+                      agentMode[0] = ag;
+                      pillOn(mAdb, !ag);
+                      pillOn(mAgent, ag);
+                      pt.setText(String.valueOf(ag ? AgentWire.PORT : 5555));
+                      pin.setVisibility(ag ? View.VISIBLE : View.GONE);
+                  };
+                  mAdb.setOnClickListener(pick);
+                  mAgent.setOnClickListener(pick);
                   h.new Dlg(h).setTitle("Tambah HP").setView(box)
                           .setPositiveButton("Tambah", (dlg, w) -> {
+                              boolean ag = agentMode[0];
+                              int defPort = ag ? AgentWire.PORT : 5555;
                               int port;
                               try {
                                   port = Integer.parseInt(pt.getText().toString().trim());
                               } catch (Exception ex) {
-                                  port = 5555;
+                                  port = defPort;
                               }
-                              if (port < 1 || port > 65535) port = 5555;
+                              if (port < 1 || port > 65535) port = defPort;
+                              String pinVal = pin.getText().toString().trim();
+                              if (ag) {
+                                  if (pinVal.isEmpty()) {
+                                      h.toastL("Isi PIN Agen (tampil di layar CFM Agen di HP itu)");
+                                      return;
+                                  }
+                                  prefs.edit().putString("pin", pinVal).apply();
+                              }
                               List<String[]> list = parseTargets(ip.getText().toString(), port);
                               if (list == null) {
                                   h.toastL("Alamat tidak valid atau terlalu banyak (maks 64)");
@@ -5651,7 +5874,7 @@ jobs:
                               for (String[] t : list) {
                                   int pp = Integer.parseInt(t[1]);
                                   if (has(t[0], pp)) continue;
-                                  devs.add(new FarmDevice(list.size() == 1 ? name : "", t[0], pp, FarmPane.this));
+                                  devs.add(new FarmDevice(list.size() == 1 ? name : "", t[0], pp, ag, ag ? pinVal : "", FarmPane.this));
                                   added++;
                               }
                               if (added == 0) {
@@ -5703,12 +5926,16 @@ jobs:
                   final EditText pt = h.edit("Port");
                   pt.setInputType(InputType.TYPE_CLASS_NUMBER);
                   pt.setText(String.valueOf(d.port));
+                  final EditText pin = h.edit("PIN Agen");
+                  pin.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  pin.setText(d.pin);
                   box.addView(nm);
                   LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(-1, -2);
                   p2.setMargins(0, dp(8), 0, 0);
                   box.addView(ip, p2);
                   box.addView(pt, p2);
-                  h.new Dlg(h).setTitle("Ubah HP").setView(box)
+                  if (d.agent) box.addView(pin, p2);
+                  h.new Dlg(h).setTitle(d.agent ? "Ubah HP (Agen)" : "Ubah HP").setView(box)
                           .setPositiveButton("Simpan", (dlg, w) -> {
                               String host = ip.getText().toString().trim();
                               int port;
@@ -5721,6 +5948,11 @@ jobs:
                                   h.toastL("Alamat atau port tidak valid");
                                   return;
                               }
+                              String pinVal = d.agent ? pin.getText().toString().trim() : "";
+                              if (d.agent && pinVal.isEmpty()) {
+                                  h.toastL("Isi PIN Agen");
+                                  return;
+                              }
                               String name = nm.getText().toString().trim();
                               int idx = devs.indexOf(d);
                               if (idx < 0) return;
@@ -5728,12 +5960,13 @@ jobs:
                                   h.toast("Alamat itu sudah ada di daftar");
                                   return;
                               }
-                              if (host.equals(d.host) && port == d.port) {
+                              if (host.equals(d.host) && port == d.port && pinVal.equals(d.pin)) {
                                   d.name = name;
                               } else {
                                   d.stop();
-                                  devs.set(idx, new FarmDevice(name, host, port, FarmPane.this));
+                                  devs.set(idx, new FarmDevice(name, host, port, d.agent, pinVal, FarmPane.this));
                               }
+                              if (d.agent) prefs.edit().putString("pin", pinVal).apply();
                               save();
                               rebuildGrid();
                           })
@@ -5741,6 +5974,28 @@ jobs:
               }
 
               // ---------- pindai jaringan ----------
+              private static final class Found {
+                  final String host;
+                  final boolean agent;
+
+                  Found(String host, boolean agent) {
+                      this.host = host;
+                      this.agent = agent;
+                  }
+
+                  int port() {
+                      return agent ? AgentWire.PORT : 5555;
+                  }
+
+                  String label() {
+                      return (agent ? "Agen  ·  " : "ADB  ·  ") + host;
+                  }
+              }
+
+              private interface PinCb {
+                  void got(String pin);
+              }
+
               private void scan() {
                   if (scanning) return;
                   final Set<String> own = new LinkedHashSet<>();
@@ -5768,14 +6023,18 @@ jobs:
                   scanDone = 0;
                   scanTotal = bases.size() * 254;
                   updateSummary();
-                  final List<String> found = Collections.synchronizedList(new ArrayList<String>());
+                  final List<Found> found = Collections.synchronizedList(new ArrayList<Found>());
                   final AtomicInteger left = new AtomicInteger(scanTotal);
                   final ExecutorService ex = Executors.newFixedThreadPool(48);
                   for (final String base : bases) {
                       for (int i = 1; i <= 254; i++) {
                           final String ipAddr = base + i;
                           ex.execute(() -> {
-                              if (!own.contains(ipAddr) && "open".equals(FarmDevice.probe(ipAddr, 5555, 450))) found.add(ipAddr);
+                              if (!own.contains(ipAddr)) {
+                                  // HP dengan ADB WiFi lebih diutamakan daripada Agen (sentuhan langsung, tanpa jeda)
+                                  if ("open".equals(FarmDevice.probe(ipAddr, 5555, 450))) found.add(new Found(ipAddr, false));
+                                  else if (AgentWire.probe(ipAddr, AgentWire.PORT, 450)) found.add(new Found(ipAddr, true));
+                              }
                               final int rem = left.decrementAndGet();
                               if (rem == 0) {
                                   ui.post(() -> finishScan(found));
@@ -5791,15 +6050,15 @@ jobs:
                   ex.shutdown();
               }
 
-              private void finishScan(List<String> found) {
+              private void finishScan(List<Found> found) {
                   scanning = false;
                   updateSummary();
-                  final List<String> fresh = new ArrayList<>();
+                  final List<Found> fresh = new ArrayList<>();
                   synchronized (found) {
-                      for (String ipAddr : found) if (!has(ipAddr, 5555)) fresh.add(ipAddr);
+                      for (Found f : found) if (!has(f.host, f.port())) fresh.add(f);
                   }
                   Collections.sort(fresh, (a, b) -> {
-                      String[] x = a.split("\\."), y = b.split("\\.");
+                      String[] x = a.host.split("\\."), y = b.host.split("\\.");
                       for (int i = 0; i < 4; i++) {
                           int c = Integer.compare(Integer.parseInt(x[i]), Integer.parseInt(y[i]));
                           if (c != 0) return c;
@@ -5808,7 +6067,7 @@ jobs:
                   });
                   if (fresh.isEmpty()) {
                       h.toastL(found.isEmpty()
-                              ? "Tidak ada HP dengan ADB WiFi (port 5555) di jaringan ini. Ketuk Panduan."
+                              ? "Tidak ada HP dengan ADB WiFi (5555) atau Agen (5600) di jaringan ini. Ketuk Panduan."
                               : "Semua HP yang ditemukan sudah ada di daftar");
                       return;
                   }
@@ -5822,36 +6081,73 @@ jobs:
                       r.setPadding(dp(14), dp(12), dp(14), dp(12));
                       r.setOnClickListener(v -> {
                           sel[idx] = !sel[idx];
-                          markRow(r, fresh.get(idx), sel[idx]);
+                          markRow(r, fresh.get(idx).label(), sel[idx]);
                       });
-                      markRow(r, fresh.get(i), true);
+                      markRow(r, fresh.get(i).label(), true);
                       LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
                       lp.setMargins(0, dp(2), 0, dp(2));
                       list.addView(r, lp);
                   }
                   MaxScroll ms = new MaxScroll(h, dp(300));
                   ms.addView(list, new FrameLayout.LayoutParams(-1, -2));
-                  h.new Dlg(h).setTitle("Ditemukan " + fresh.size() + " HP").setMessage("HP dengan ADB WiFi aktif di port 5555:")
+                  h.new Dlg(h).setTitle("Ditemukan " + fresh.size() + " HP")
+                          .setMessage("ADB = ADB WiFi aktif. Agen = HP yang menjalankan CFM Agen (perlu PIN).")
                           .setView(ms)
                           .setPositiveButton("Tambahkan", (dlg, w) -> {
-                              int added = 0;
+                              final List<Found> pick = new ArrayList<>();
+                              boolean needPin = false;
                               for (int i = 0; i < fresh.size(); i++) {
-                                  if (sel[i] && !has(fresh.get(i), 5555)) {
-                                      devs.add(new FarmDevice("", fresh.get(i), 5555, FarmPane.this));
-                                      added++;
-                                  }
+                                  if (!sel[i]) continue;
+                                  pick.add(fresh.get(i));
+                                  if (fresh.get(i).agent) needPin = true;
                               }
-                              if (added > 0) {
-                                  save();
-                                  rebuildGrid();
-                                  h.toast(added + " HP ditambahkan");
-                              }
+                              if (pick.isEmpty()) return;
+                              if (needPin) askPin(pin -> addFound(pick, pin));
+                              else addFound(pick, "");
                           })
                           .setNegativeButton("Batal", null).show();
               }
 
-              private void markRow(TextView r, String ipAddr, boolean on) {
-                  r.setText((on ? "✓  " : "○  ") + ipAddr);
+              private void addFound(List<Found> pick, String pin) {
+                  int added = 0;
+                  for (Found f : pick) {
+                      if (has(f.host, f.port())) continue;
+                      devs.add(new FarmDevice("", f.host, f.port(), f.agent, f.agent ? pin : "", this));
+                      added++;
+                  }
+                  if (added > 0) {
+                      save();
+                      rebuildGrid();
+                      h.toast(added + " HP ditambahkan");
+                  }
+              }
+
+              private void askPin(final PinCb cb) {
+                  final EditText e = h.edit("PIN Agen");
+                  e.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  e.setText(prefs.getString("pin", ""));
+                  LinearLayout box = new LinearLayout(h);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.addView(e);
+                  TextView hint = h.text("PIN tampil di layar CFM Agen pada HP farm. Bila semua HP farm memakai PIN yang sama, cukup masukkan sekali. "
+                          + "Bisa diubah per HP lewat tekan lama kartunya.", 11.5f, MainActivity.DIM, false);
+                  hint.setPadding(0, dp(8), 0, 0);
+                  box.addView(hint);
+                  h.new Dlg(h).setTitle("PIN Agen").setView(box)
+                          .setPositiveButton("Lanjut", (dlg, w) -> {
+                              String pin = e.getText().toString().trim();
+                              if (pin.isEmpty()) {
+                                  h.toastL("Isi PIN Agen");
+                                  return;
+                              }
+                              prefs.edit().putString("pin", pin).apply();
+                              cb.got(pin);
+                          })
+                          .setNegativeButton("Batal", null).show();
+              }
+
+              private void markRow(TextView r, String label, boolean on) {
+                  r.setText((on ? "✓  " : "○  ") + label);
                   r.setTextColor(on ? MainActivity.FG : MainActivity.DIM);
                   r.setBackground(on ? h.rip(0x337AA7FF, 12, MainActivity.ACC) : h.rip(MainActivity.CARD2, 12, MainActivity.LINE));
               }
@@ -6010,18 +6306,32 @@ jobs:
 
               // ---------- panduan ----------
               private void guide() {
-                  String t = "CARA 1 · TANPA PC (pakai HP ini)\n"
-                          + "1. Di HP farm: Opsi pengembang → aktifkan Debugging USB, dan sambungkan HP farm ke WiFi/hotspot HP ini.\n"
-                          + "2. Pasang adaptor OTG di HP ini, lalu sambungkan kabel data ke HP farm (boleh lewat hub USB untuk beberapa HP sekaligus).\n"
-                          + "3. Ketuk Via USB. Izinkan akses USB di HP ini; di HP farm ketuk Izinkan debugging (centang Selalu izinkan).\n"
-                          + "4. HP farm otomatis masuk daftar dan layarnya tampil. Cabut kabel.\n"
-                          + "Tidak perlu root, dan jalan di Android 8 dan 9.\n\n"
-                          + "CARA 2 · DENGAN PC\n"
+                  String t = "CARA 1 · TANPA PC DAN TANPA OTG (Mode Agen)\n"
+                          + "Cocok untuk HP farm non-root, termasuk Android 8 dan 9 (butuh Android 7 ke atas untuk sentuhan).\n"
+                          + "1. Pasang aplikasi ini juga di setiap HP farm, dan sambungkan ke WiFi/hotspot HP ini.\n"
+                          + "2. Di HP farm buka ikon CFM Agen. Ketuk Buka Pengaturan Aksesibilitas, pilih CFM Agen, aktifkan.\n"
+                          + "3. Ketuk Mulai, lalu Mulai sekarang di dialog Android (pilih Seluruh layar bila ditanya).\n"
+                          + "4. Catat PIN yang tampil. Pakai PIN yang sama di semua HP farm agar cukup sekali memasukkannya.\n"
+                          + "5. Di HP ini ketuk Pindai WiFi, centang HP bertanda Agen, masukkan PIN. Layar langsung tampil dan bisa disentuh.\n"
+                          + "Batasan Mode Agen:\n"
+                          + "• Gestur geser diputar ulang setelah jari diangkat, jadi sedikit tertunda dibanding ADB.\n"
+                          + "• Tidak ada perintah shell; tombol Home, Kembali, Terbaru, Daya, Volume, dan ketik teks tetap jalan. "
+                          + "Tombol Daya membangunkan layar; mengunci layar hanya bisa di Android 9 ke atas.\n"
+                          + "• Izin tangkap layar harus diberikan lagi setiap HP farm dinyalakan ulang.\n"
+                          + "• Matikan kunci layar di HP farm. Layar terkunci PIN tidak bisa dibuka dari jauh.\n"
+                          + "• Aplikasi yang melarang tangkapan layar (perbankan, DRM) tampil hitam.\n"
+                          + "• Putar layar: putar HP farm-nya langsung, tampilan mengikuti.\n"
+                          + "• Android 13 ke atas: bila Aksesibilitas abu-abu, buka Info aplikasi → titik tiga → Izinkan pengaturan terbatas.\n\n"
+                          + "CARA 2 · PAKAI KABEL OTG (ADB)\n"
+                          + "1. Di HP farm: Opsi pengembang → aktifkan Debugging USB, dan sambungkan ke WiFi/hotspot HP ini.\n"
+                          + "2. Pasang adaptor OTG di HP ini, sambungkan kabel data ke HP farm.\n"
+                          + "3. Ketuk Via USB (OTG). Izinkan akses USB di HP ini; di HP farm ketuk Izinkan debugging.\n"
+                          + "Hasilnya ADB WiFi aktif: sentuhan langsung tanpa jeda dan perintah shell tersedia.\n\n"
+                          + "CARA 3 · DENGAN PC\n"
                           + "Colok HP ke komputer, jalankan  adb tcpip 5555  lalu cabut USB. Setelah itu ketuk Pindai WiFi.\n\n"
                           + "Catatan\n"
-                          + "• Setelah HP farm restart, port 5555 hilang: ulangi Via USB (dialog izin biasanya tidak muncul lagi).\n"
-                          + "• Debugging nirkabel Android 11+ (kode pairing) belum didukung; pakai Via USB.\n"
-                          + "• Gunakan kabel data, bukan kabel yang hanya untuk mengisi daya.\n"
+                          + "• ADB: setelah HP farm restart, port 5555 hilang dan Via USB perlu diulang.\n"
+                          + "• Debugging nirkabel Android 11+ (kode pairing) belum didukung.\n"
                           + "• Makin banyak HP makin berat; pakai Kualitas Hemat bila terasa patah-patah.";
                   showText("Cara menyiapkan HP", t);
               }
@@ -6463,6 +6773,1633 @@ jobs:
                   }
               }
           }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentWire.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.DataInputStream;
+          import java.io.DataOutputStream;
+          import java.io.IOException;
+          import java.net.InetSocketAddress;
+          import java.net.Socket;
+          import java.nio.ByteBuffer;
+          import java.security.MessageDigest;
+
+          /**
+           * Protokol "Mode Agen": HP farm menjalankan aplikasi ini sebagai agen (tangkap layar + layanan Aksesibilitas),
+           * HP pengendali menyambung lewat TCP. Tanpa ADB, tanpa kabel, tanpa PC.
+           *
+           * Murni Java (tanpa kelas Android) supaya bisa diuji di komputer.
+           *
+           * Jabat tangan:
+           *   server -> klien : "CFMA" ver(1) nonce(16)
+           *   klien  -> server: SHA-256(nonce + PIN)(32) maxSize(i32) bitrate(i32) fps(i32)
+           *   server -> klien : status(1)  1 = OK, 2 = OK tetapi sentuhan belum aktif, 0 = PIN salah, 3 = galat + teks(u16 + utf8)
+           *   bila OK         : nama(64) codec(i32 = "h264") lebar(i32) tinggi(i32)
+           * Lalu server mengirim paket video seperti scrcpy: pts+flag(i64, bit63 = config, bit62 = keyframe) ukuran(i32) data.
+           * Paket berukuran 0 = detak jantung (diabaikan).
+           *
+           * Klien -> server (setelah jabat tangan), tiap pesan diawali 1 byte tipe:
+           *   1 TOUCH  aksi(u8) x(u16) y(u16)    koordinat 0..65535 relatif ke layar penuh
+           *   2 KEY    kode(i32)                 kode keyevent Android
+           *   3 TEXT   panjang(u16) utf8
+           *   4 SYNC   minta keyframe baru
+           *   5 PING   penanda hidup
+           */
+          final class AgentWire {
+
+              static final int PORT = 5600;
+              static final int VERSION = 1;
+              static final byte[] MAGIC = {'C', 'F', 'M', 'A'};
+              static final int CODEC_H264 = 0x68323634;
+
+              static final int ST_BADPIN = 0, ST_OK = 1, ST_OK_NOCONTROL = 2, ST_ERROR = 3;
+              static final int C_TOUCH = 1, C_KEY = 2, C_TEXT = 3, C_SYNC = 4, C_PING = 5;
+              static final int MAX_TEXT = 4000;
+
+              private AgentWire() { }
+
+              /** Hasil jabat tangan di sisi klien. */
+              static final class Hello {
+                  String name = "";
+                  int width, height;
+                  boolean control;
+              }
+
+              static byte[] hash(byte[] nonce, String pin) {
+                  try {
+                      MessageDigest md = MessageDigest.getInstance("SHA-256");
+                      md.update(nonce);
+                      md.update(pin == null ? new byte[0] : pin.getBytes("UTF-8"));
+                      return md.digest();
+                  } catch (Exception e) {
+                      throw new IllegalStateException(e);
+                  }
+              }
+
+              // ---------- pesan kontrol (klien -> server) ----------
+              static int to16(float v) {
+                  if (v != v) return 0;
+                  int i = Math.round(v * 65535f);
+                  return i < 0 ? 0 : (i > 65535 ? 65535 : i);
+              }
+
+              static byte[] touchMsg(int action, float nx, float ny) {
+                  ByteBuffer b = ByteBuffer.allocate(6);
+                  b.put((byte) C_TOUCH).put((byte) action).putShort((short) to16(nx)).putShort((short) to16(ny));
+                  return b.array();
+              }
+
+              static byte[] keyMsg(int code) {
+                  ByteBuffer b = ByteBuffer.allocate(5);
+                  b.put((byte) C_KEY).putInt(code);
+                  return b.array();
+              }
+
+              static byte[] textMsg(String s) {
+                  byte[] t;
+                  try {
+                      t = s.getBytes("UTF-8");
+                  } catch (Exception e) {
+                      t = new byte[0];
+                  }
+                  if (t.length > MAX_TEXT) t = java.util.Arrays.copyOf(t, MAX_TEXT);
+                  ByteBuffer b = ByteBuffer.allocate(3 + t.length);
+                  b.put((byte) C_TEXT).putShort((short) t.length).put(t);
+                  return b.array();
+              }
+
+              static byte[] simpleMsg(int type) {
+                  return new byte[]{(byte) type};
+              }
+
+              // ---------- sisi klien ----------
+              /** Jabat tangan dari sisi pengendali. Melempar IOException berisi pesan yang bisa ditampilkan ke pengguna. */
+              static Hello clientHello(DataInputStream in, DataOutputStream out, String pin, int maxSize, int bitrate, int fps) throws IOException {
+                  byte[] magic = new byte[4];
+                  in.readFully(magic);
+                  if (!java.util.Arrays.equals(magic, MAGIC)) throw new IOException("Bukan Agen CFM (port ini dipakai layanan lain)");
+                  int ver = in.readUnsignedByte();
+                  if (ver != VERSION) throw new IOException("Versi Agen berbeda (" + ver + "). Perbarui aplikasi di kedua HP");
+                  byte[] nonce = new byte[16];
+                  in.readFully(nonce);
+                  out.write(hash(nonce, pin));
+                  out.writeInt(maxSize);
+                  out.writeInt(bitrate);
+                  out.writeInt(fps);
+                  out.flush();
+                  int st = in.readUnsignedByte();
+                  if (st == ST_BADPIN) throw new IOException("PIN Agen salah. Ubah PIN lewat menu titik tiga di kartu HP");
+                  if (st == ST_ERROR) {
+                      int n = in.readUnsignedShort();
+                      byte[] m = new byte[n];
+                      in.readFully(m);
+                      throw new IOException(new String(m, "UTF-8"));
+                  }
+                  if (st != ST_OK && st != ST_OK_NOCONTROL) throw new IOException("Jawaban Agen tidak dikenal");
+                  byte[] name = new byte[64];
+                  in.readFully(name);
+                  int len = 0;
+                  while (len < name.length && name[len] != 0) len++;
+                  Hello h = new Hello();
+                  h.name = new String(name, 0, len, "UTF-8");
+                  h.control = st == ST_OK;
+                  int codec = in.readInt();
+                  if (codec != CODEC_H264) throw new IOException("Codec video Agen tidak didukung");
+                  h.width = in.readInt();
+                  h.height = in.readInt();
+                  if (h.width <= 0 || h.height <= 0 || h.width > 8192 || h.height > 8192) throw new IOException("Ukuran video tidak valid");
+                  return h;
+              }
+
+              /** true bila host:port menjawab seperti Agen CFM. Dipakai saat memindai jaringan. */
+              static boolean probe(String host, int port, int timeoutMs) {
+                  try (Socket s = new Socket()) {
+                      s.connect(new InetSocketAddress(host, port), timeoutMs);
+                      s.setSoTimeout(Math.max(500, timeoutMs));
+                      DataInputStream in = new DataInputStream(s.getInputStream());
+                      byte[] m = new byte[5];
+                      in.readFully(m);
+                      return m[0] == MAGIC[0] && m[1] == MAGIC[1] && m[2] == MAGIC[2] && m[3] == MAGIC[3];
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              // ---------- bantuan sisi server ----------
+              static byte[] errorReply(String msg) {
+                  try {
+                      byte[] t = msg.getBytes("UTF-8");
+                      if (t.length > 400) t = java.util.Arrays.copyOf(t, 400);
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      DataOutputStream d = new DataOutputStream(bo);
+                      d.writeByte(ST_ERROR);
+                      d.writeShort(t.length);
+                      d.write(t);
+                      return bo.toByteArray();
+                  } catch (IOException e) {
+                      return new byte[]{(byte) ST_ERROR, 0, 0};
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentServer.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import java.io.BufferedInputStream;
+          import java.io.BufferedOutputStream;
+          import java.io.DataInputStream;
+          import java.io.DataOutputStream;
+          import java.io.IOException;
+          import java.net.InetSocketAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.SocketTimeoutException;
+          import java.security.MessageDigest;
+          import java.security.SecureRandom;
+
+          /**
+           * Server TCP milik Agen. Mengurus jabat tangan + PIN, mengirim paket video dari Backend, dan meneruskan
+           * pesan kontrol ke Backend. Satu klien aktif pada satu waktu: klien baru yang lolos PIN menggantikan yang lama
+           * (pengendali memulai ulang aliran saat ganti kualitas atau berpindah dari grid ke layar kontrol).
+           *
+           * Murni Java; Backend (tangkap layar, encoder, sentuhan) disediakan AgentService.
+           */
+          final class AgentServer {
+
+              /** Tempat encoder menaruh paket. Boleh dipanggil dari thread mana pun; melempar IOException bila klien putus. */
+              interface Sink {
+                  void packet(boolean config, boolean key, long ptsUs, byte[] data, int off, int len) throws IOException;
+              }
+
+              interface Backend {
+                  String deviceName();
+
+                  /** true bila sentuhan/tombol bisa dijalankan (layanan Aksesibilitas aktif). */
+                  boolean controlReady();
+
+                  /** Mulai menangkap layar. Mengembalikan {lebar, tinggi} video awal. Harus menghentikan aliran sebelumnya. */
+                  int[] startVideo(int maxSize, int bitrate, int fps, Sink sink) throws IOException;
+
+                  /**
+                   * Hentikan aliran video. s = sink milik sesi yang berhenti: bila aliran sudah dipegang sesi lain
+                   * (klien menyambung ulang secepat itu), tidak boleh dihentikan. s == null berarti hentikan apa pun.
+                   */
+                  void stopVideo(Sink s);
+
+                  void requestSync();
+
+                  /** nx, ny: 0..65535 relatif ke layar penuh. action: 0 turun, 1 angkat, 2 geser. */
+                  void touch(int action, int nx, int ny);
+
+                  void key(int code);
+
+                  void text(String s);
+              }
+
+              private final Backend backend;
+              private final int port;
+              private final long idleMs;
+              private final long beatMs;
+              private final SecureRandom rnd = new SecureRandom();
+              private volatile String pin;
+              private ServerSocket server;
+              private Thread acceptor;
+              private volatile boolean closed;
+              private Session current;
+
+              AgentServer(Backend backend, String pin, int port) {
+                  this(backend, pin, port, 10000, 1500);
+              }
+
+              AgentServer(Backend backend, String pin, int port, long idleMs, long beatMs) {
+                  this.backend = backend;
+                  this.pin = pin == null ? "" : pin;
+                  this.port = port;
+                  this.idleMs = idleMs;
+                  this.beatMs = beatMs;
+              }
+
+              void setPin(String p) {
+                  pin = p == null ? "" : p;
+              }
+
+              int port() {
+                  return server == null ? port : server.getLocalPort();
+              }
+
+              synchronized boolean hasClient() {
+                  return current != null;
+              }
+
+              /** Putuskan klien yang sedang tersambung (mis. encoder mati). Server tetap menerima sambungan baru. */
+              void kick() {
+                  Session s;
+                  synchronized (this) {
+                      s = current;
+                  }
+                  if (s != null) s.close();
+              }
+
+              void start() throws IOException {
+                  ServerSocket ss = new ServerSocket();
+                  ss.setReuseAddress(true);
+                  try {
+                      ss.bind(new InetSocketAddress(port));
+                  } catch (IOException e) {
+                      try { ss.close(); } catch (IOException ignored) { }
+                      throw new IOException("Port " + port + " tidak bisa dibuka (" + e.getMessage() + ")");
+                  }
+                  server = ss;
+                  acceptor = new Thread(this::acceptLoop, "agent-accept");
+                  acceptor.setDaemon(true);
+                  acceptor.start();
+              }
+
+              void stop() {
+                  closed = true;
+                  ServerSocket ss = server;
+                  if (ss != null) {
+                      try { ss.close(); } catch (IOException ignored) { }
+                  }
+                  Session s;
+                  synchronized (this) {
+                      s = current;
+                      current = null;
+                  }
+                  if (s != null) s.close();
+                  backend.stopVideo(null);
+              }
+
+              private void acceptLoop() {
+                  while (!closed) {
+                      final Socket s;
+                      try {
+                          s = server.accept();
+                      } catch (IOException e) {
+                          return;
+                      }
+                      Thread t = new Thread(() -> new Session(s).run(), "agent-client");
+                      t.setDaemon(true);
+                      t.start();
+                  }
+              }
+
+              private final class Session implements Sink {
+                  final Socket sock;
+                  DataInputStream in;
+                  DataOutputStream out;
+                  final Object wlock = new Object();
+                  volatile boolean dead;
+                  volatile long lastWrite;
+                  Thread beat;
+                  Thread self;
+
+                  Session(Socket s) {
+                      sock = s;
+                  }
+
+                  void close() {
+                      dead = true;
+                      try { sock.close(); } catch (IOException ignored) { }
+                  }
+
+                  void run() {
+                      self = Thread.currentThread();
+                      boolean owner = false;
+                      try {
+                          sock.setTcpNoDelay(true);
+                          sock.setSoTimeout(5000);
+                          in = new DataInputStream(new BufferedInputStream(sock.getInputStream(), 4096));
+                          out = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream(), 65536));
+
+                          byte[] nonce = new byte[16];
+                          rnd.nextBytes(nonce);
+                          out.write(AgentWire.MAGIC);
+                          out.writeByte(AgentWire.VERSION);
+                          out.write(nonce);
+                          out.flush();
+
+                          byte[] got = new byte[32];
+                          in.readFully(got);
+                          int maxSize = in.readInt(), bitrate = in.readInt(), fps = in.readInt();
+                          if (!MessageDigest.isEqual(got, AgentWire.hash(nonce, pin))) {
+                              out.writeByte(AgentWire.ST_BADPIN);
+                              out.flush();
+                              return;
+                          }
+                          if (maxSize < 0 || maxSize > 4096) maxSize = 0;
+                          if (bitrate < 50000 || bitrate > 40000000) bitrate = 1000000;
+                          if (fps < 1 || fps > 60) fps = 30;
+
+                          // klien lolos PIN: gantikan klien lama
+                          Session old;
+                          synchronized (AgentServer.this) {
+                              if (closed) return;
+                              old = current;
+                              current = this;
+                              owner = true;
+                          }
+                          if (old != null) {
+                              old.close();
+                              try { old.self.join(3000); } catch (InterruptedException ignored) { }
+                          }
+
+                          // kunci tulis dipegang sejak encoder dimulai sampai header terkirim: paket pertama encoder
+                          // (yang bisa keluar seketika) menunggu di sini, jadi tidak pernah mendahului header
+                          synchronized (wlock) {
+                              int[] size;
+                              try {
+                                  size = backend.startVideo(maxSize, bitrate, fps, this);
+                              } catch (Throwable e) {
+                                  String m = e.getMessage() == null ? e.toString() : e.getMessage();
+                                  out.write(AgentWire.errorReply(m));
+                                  out.flush();
+                                  return;
+                              }
+                              out.writeByte(backend.controlReady() ? AgentWire.ST_OK : AgentWire.ST_OK_NOCONTROL);
+                              byte[] nm = backend.deviceName().getBytes("UTF-8");
+                              byte[] name = new byte[64];
+                              System.arraycopy(nm, 0, name, 0, Math.min(63, nm.length));
+                              out.write(name);
+                              out.writeInt(AgentWire.CODEC_H264);
+                              out.writeInt(size[0]);
+                              out.writeInt(size[1]);
+                              out.flush();
+                              lastWrite = System.currentTimeMillis();
+                          }
+                          startBeat();
+                          sock.setSoTimeout((int) idleMs);
+                          control();
+                      } catch (Throwable ignored) {
+                          // klien putus atau salah protokol: cukup tutup
+                      } finally {
+                          close();
+                          boolean mine = false;
+                          synchronized (AgentServer.this) {
+                              if (owner && current == this) {
+                                  current = null;
+                                  mine = true;
+                              }
+                          }
+                          if (mine) backend.stopVideo(this);
+                      }
+                  }
+
+                  void startBeat() {
+                      beat = new Thread(() -> {
+                          while (!dead) {
+                              try {
+                                  Thread.sleep(beatMs / 2 > 0 ? beatMs / 2 : 1);
+                              } catch (InterruptedException e) {
+                                  return;
+                              }
+                              if (dead) return;
+                              if (System.currentTimeMillis() - lastWrite >= beatMs) {
+                                  try {
+                                      packet(false, false, 0, new byte[0], 0, 0);
+                                  } catch (IOException e) {
+                                      return;
+                                  }
+                              }
+                          }
+                      }, "agent-beat");
+                      beat.setDaemon(true);
+                      beat.start();
+                  }
+
+                  void control() throws IOException {
+                      while (!dead) {
+                          int t;
+                          try {
+                              t = in.read();
+                          } catch (SocketTimeoutException e) {
+                              return; // pengendali diam terlalu lama (WiFi putus)
+                          }
+                          if (t < 0) return;
+                          switch (t) {
+                              case AgentWire.C_TOUCH: {
+                                  int a = in.readUnsignedByte();
+                                  int x = in.readUnsignedShort(), y = in.readUnsignedShort();
+                                  if (a <= 2) backend.touch(a, x, y);
+                                  break;
+                              }
+                              case AgentWire.C_KEY:
+                                  backend.key(in.readInt());
+                                  break;
+                              case AgentWire.C_TEXT: {
+                                  int n = in.readUnsignedShort();
+                                  if (n > AgentWire.MAX_TEXT) return;
+                                  byte[] b = new byte[n];
+                                  in.readFully(b);
+                                  backend.text(new String(b, "UTF-8"));
+                                  break;
+                              }
+                              case AgentWire.C_SYNC:
+                                  backend.requestSync();
+                                  break;
+                              case AgentWire.C_PING:
+                                  break;
+                              default:
+                                  return; // pesan tidak dikenal: protokol rusak
+                          }
+                      }
+                  }
+
+                  @Override
+                  public void packet(boolean config, boolean key, long ptsUs, byte[] data, int off, int len) throws IOException {
+                      if (dead) throw new IOException("klien putus");
+                      try {
+                          synchronized (wlock) {
+                              long pf = ptsUs & 0x3FFFFFFFFFFFFFFFL;
+                              if (config) pf |= 1L << 63;
+                              if (key) pf |= 1L << 62;
+                              out.writeLong(pf);
+                              out.writeInt(len);
+                              if (len > 0) out.write(data, off, len);
+                              out.flush();
+                              lastWrite = System.currentTimeMillis();
+                          }
+                      } catch (IOException e) {
+                          close();
+                          throw e;
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentService.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.AudioManager;
+          import android.media.MediaCodec;
+          import android.media.MediaCodecInfo;
+          import android.media.MediaFormat;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import android.view.Surface;
+          import java.io.IOException;
+          import java.net.Inet4Address;
+          import java.net.InetAddress;
+          import java.net.InterfaceAddress;
+          import java.net.NetworkInterface;
+          import java.nio.ByteBuffer;
+          import java.security.SecureRandom;
+          import java.util.ArrayList;
+          import java.util.Enumeration;
+          import java.util.List;
+
+          /**
+           * Mode Agen di HP farm: menangkap layar (MediaProjection), mengubahnya menjadi H.264, dan melayani HP
+           * pengendali lewat AgentServer (TCP). Sentuhan dan tombol dijalankan oleh AgentAccess.
+           */
+          public final class AgentService extends Service implements AgentServer.Backend {
+
+              static final String ACTION_START = "id.cfm.webui.AGENT_START";
+              static final String ACTION_STOP = "id.cfm.webui.AGENT_STOP";
+              static final String EXTRA_CODE = "code";
+              static final String EXTRA_DATA = "data";
+              private static final String CHANNEL = "cfm_agent";
+              private static final int NOTIF_ID = 5600;
+
+              static volatile AgentService instance;
+              static volatile String lastError = "";
+
+              /** Kegagalan encoder (boleh dicoba ulang dengan ukuran lain), berbeda dari kegagalan layar virtual. */
+              private static final class EncoderException extends IOException {
+                  EncoderException(String m) {
+                      super(m);
+                  }
+              }
+
+              private final Object vlock = new Object();
+              private HandlerThread ht;
+              private Handler hh;
+              private MediaProjection projection;
+              private MediaProjection.Callback pcb;
+              private VirtualDisplay vd;
+              private AgentServer server;
+              private PowerManager.WakeLock wake;
+              private DisplayManager dm;
+              private boolean closing;
+              private Pipe pipe;
+              private AgentServer.Sink sink;
+              private int reqMax, reqBitrate, reqFps;
+              private int realW, realH;
+
+              // ---------- pengaturan bersama dengan AgentActivity ----------
+              static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences("agent", Context.MODE_PRIVATE);
+              }
+
+              static String pin(Context c) {
+                  SharedPreferences p = prefs(c);
+                  String pin = p.getString("pin", "");
+                  if (pin.length() < 4) {
+                      pin = String.valueOf(100000 + new SecureRandom().nextInt(900000));
+                      p.edit().putString("pin", pin).apply();
+                  }
+                  return pin;
+              }
+
+              static void setPin(Context c, String pin) {
+                  prefs(c).edit().putString("pin", pin).apply();
+                  AgentService s = instance;
+                  if (s != null && s.server != null) s.server.setPin(pin);
+              }
+
+              static boolean keepAwake(Context c) {
+                  return prefs(c).getBoolean("awake", true);
+              }
+
+              static void setKeepAwake(Context c, boolean v) {
+                  prefs(c).edit().putBoolean("awake", v).apply();
+                  AgentService s = instance;
+                  if (s != null) s.applyWake();
+              }
+
+              /** Alamat IPv4 pribadi HP ini (WiFi atau hotspot). */
+              static List<String> addresses() {
+                  List<String> out = new ArrayList<>();
+                  try {
+                      Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+                      while (en != null && en.hasMoreElements()) {
+                          NetworkInterface ni = en.nextElement();
+                          if (ni.isLoopback() || !ni.isUp()) continue;
+                          for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                              InetAddress a = ia.getAddress();
+                              if (a instanceof Inet4Address && a.isSiteLocalAddress()) out.add(a.getHostAddress());
+                          }
+                      }
+                  } catch (Exception ignored) { }
+                  return out;
+              }
+
+              boolean clientConnected() {
+                  AgentServer s = server;
+                  return s != null && s.hasClient();
+              }
+
+              // ---------- siklus hidup ----------
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (ACTION_STOP.equals(intent.getAction())) {
+                      shutdown();
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
+                  if (projection != null) return START_NOT_STICKY; // sudah berjalan
+                  try {
+                      // Android 10+ mewajibkan layanan foreground bertipe mediaProjection sebelum izin tangkap layar dipakai
+                      Notification n = notification();
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                      } else {
+                          startForeground(NOTIF_ID, n);
+                      }
+                      begin(intent.getIntExtra(EXTRA_CODE, 0), (Intent) intent.getParcelableExtra(EXTRA_DATA));
+                      lastError = "";
+                  } catch (Throwable e) {
+                      lastError = e.getMessage() == null ? e.toString() : e.getMessage();
+                      shutdown();
+                      stopSelf();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  shutdown();
+                  super.onDestroy();
+              }
+
+              private void begin(int code, Intent data) throws IOException {
+                  if (data == null) throw new IOException("Izin tangkap layar tidak diberikan");
+                  closing = false;
+                  MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                  if (m == null) throw new IOException("Tangkap layar tidak tersedia di HP ini");
+                  ht = new HandlerThread("agent-h");
+                  ht.start();
+                  hh = new Handler(ht.getLooper());
+                  MediaProjection p = m.getMediaProjection(code, data);
+                  if (p == null) throw new IOException("Izin tangkap layar ditolak");
+                  projection = p;
+                  pcb = new MediaProjection.Callback() {
+                      @Override
+                      public void onStop() {
+                          if (closing) return;
+                          lastError = "Berbagi layar dihentikan dari HP ini";
+                          Handler h = hh;
+                          if (h != null) {
+                              h.post(() -> {
+                                  shutdown();
+                                  stopSelf();
+                              });
+                          }
+                      }
+                  };
+                  p.registerCallback(pcb, hh); // wajib didaftarkan sebelum createVirtualDisplay (Android 14)
+
+                  server = new AgentServer(this, pin(this), AgentWire.PORT);
+                  server.start();
+
+                  dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                  if (dm != null) dm.registerDisplayListener(displayListener, hh);
+                  applyWake();
+                  instance = this;
+              }
+
+              private synchronized void shutdown() {
+                  if (closing) return;
+                  closing = true;
+                  AgentServer s = server;
+                  server = null;
+                  if (s != null) s.stop();
+                  if (dm != null) {
+                      try { dm.unregisterDisplayListener(displayListener); } catch (Throwable ignored) { }
+                      dm = null;
+                  }
+                  synchronized (vlock) {
+                      stopPipelineLocked();
+                      if (vd != null) {
+                          try { vd.release(); } catch (Throwable ignored) { }
+                          vd = null;
+                      }
+                  }
+                  MediaProjection p = projection;
+                  projection = null;
+                  if (p != null) {
+                      try { if (pcb != null) p.unregisterCallback(pcb); } catch (Throwable ignored) { }
+                      try { p.stop(); } catch (Throwable ignored) { }
+                  }
+                  if (wake != null) {
+                      try { if (wake.isHeld()) wake.release(); } catch (Throwable ignored) { }
+                      wake = null;
+                  }
+                  try { stopForeground(true); } catch (Throwable ignored) { }
+                  if (ht != null) {
+                      ht.quitSafely();
+                      ht = null;
+                  }
+                  instance = null;
+              }
+
+              @SuppressWarnings("deprecation")
+              private synchronized void applyWake() {
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  if (pm == null) return;
+                  boolean want = keepAwake(this) && projection != null && !closing;
+                  if (want && wake == null) {
+                      wake = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "cfm:agent");
+                      wake.setReferenceCounted(false);
+                      wake.acquire();
+                  } else if (!want && wake != null) {
+                      try { if (wake.isHeld()) wake.release(); } catch (Throwable ignored) { }
+                      wake = null;
+                  }
+              }
+
+              // ---------- notifikasi ----------
+              private Notification notification() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (Build.VERSION.SDK_INT >= 26 && nm != null) {
+                      nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Mode Agen", NotificationManager.IMPORTANCE_LOW));
+                  }
+                  int imm = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+                  PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, AgentActivity.class), PendingIntent.FLAG_UPDATE_CURRENT | imm);
+                  PendingIntent stop = PendingIntent.getService(this, 1, new Intent(this, AgentService.class).setAction(ACTION_STOP),
+                          PendingIntent.FLAG_UPDATE_CURRENT | imm);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+                  List<String> ips = addresses();
+                  b.setContentTitle("CFM Agen aktif")
+                          .setContentText("Siap dikontrol · " + (ips.isEmpty() ? "" : ips.get(0) + " · ") + "port " + AgentWire.PORT)
+                          .setSmallIcon(Build.VERSION.SDK_INT >= 23 ? R.drawable.ic_farm : android.R.drawable.ic_menu_view)
+                          .setOngoing(true)
+                          .setContentIntent(open)
+                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Berhenti", stop);
+                  return b.build();
+              }
+
+              // ---------- AgentServer.Backend ----------
+              @Override
+              public String deviceName() {
+                  String m = Build.MODEL;
+                  return m == null || m.isEmpty() ? "HP" : m;
+              }
+
+              @Override
+              public boolean controlReady() {
+                  return AgentAccess.instance != null;
+              }
+
+              @Override
+              public int[] startVideo(int maxSize, int bitrate, int fps, AgentServer.Sink s) throws IOException {
+                  synchronized (vlock) {
+                      if (projection == null || closing) throw new IOException("Berbagi layar belum aktif di HP itu");
+                      stopPipelineLocked();
+                      reqMax = maxSize;
+                      reqBitrate = bitrate;
+                      reqFps = fps;
+                      sink = s;
+                      return startPipelineLocked();
+                  }
+              }
+
+              @Override
+              public void stopVideo(AgentServer.Sink s) {
+                  synchronized (vlock) {
+                      if (s != null && s != sink) return; // sesi lain sudah mengambil alih aliran
+                      stopPipelineLocked();
+                      sink = null;
+                  }
+              }
+
+              @Override
+              public void requestSync() {
+                  synchronized (vlock) {
+                      if (pipe != null) pipe.requestSync();
+                  }
+              }
+
+              @Override
+              public void touch(int action, int nx, int ny) {
+                  AgentAccess a = AgentAccess.instance;
+                  if (a != null) a.touch(action, nx, ny);
+              }
+
+              @Override
+              public void key(int code) {
+                  try {
+                      if (code == 24 || code == 25) {
+                          AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                          if (am != null) {
+                              am.adjustStreamVolume(AudioManager.STREAM_MUSIC, code == 24 ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
+                                      AudioManager.FLAG_SHOW_UI);
+                          }
+                      } else if (code == 26) {
+                          power();
+                      } else {
+                          AgentAccess a = AgentAccess.instance;
+                          if (a != null) a.key(code);
+                      }
+                  } catch (Throwable ignored) { }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void power() {
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  if (pm == null) return;
+                  if (!pm.isInteractive()) {
+                      PowerManager.WakeLock w = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "cfm:wake");
+                      w.acquire(3000);
+                  } else {
+                      AgentAccess a = AgentAccess.instance;
+                      if (a != null) a.lockScreen();
+                  }
+              }
+
+              @Override
+              public void text(String s) {
+                  AgentAccess a = AgentAccess.instance;
+                  if (a != null) a.type(s);
+              }
+
+              // ---------- tangkap layar + encoder ----------
+              private int[] realSize() {
+                  DisplayMetrics m = new DisplayMetrics();
+                  DisplayManager d = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                  Display disp = d == null ? null : d.getDisplay(Display.DEFAULT_DISPLAY);
+                  if (disp != null) disp.getRealMetrics(m);
+                  else m = getResources().getDisplayMetrics();
+                  return new int[]{m.widthPixels, m.heightPixels, m.densityDpi};
+              }
+
+              private static int alignDown(int v, int a) {
+                  return Math.max(a, (v / a) * a);
+              }
+
+              private int[] startPipelineLocked() throws IOException {
+                  int[] r = realSize();
+                  realW = r[0];
+                  realH = r[1];
+                  int w0 = r[0], h0 = r[1];
+                  int mx = Math.max(w0, h0);
+                  if (reqMax > 0 && mx > reqMax) {
+                      float sc = reqMax / (float) mx;
+                      w0 = Math.round(w0 * sc);
+                      h0 = Math.round(h0 * sc);
+                  }
+                  IOException last = null;
+                  for (int align : new int[]{8, 16, 32}) {
+                      int w = alignDown(w0, align), h = alignDown(h0, align);
+                      try {
+                          pipe = new Pipe(w, h, r[2], reqBitrate, reqFps, sink);
+                          return new int[]{w, h};
+                      } catch (EncoderException e) {
+                          last = e; // encoder menolak ukuran ini: coba kelipatan yang lebih besar
+                      }
+                  }
+                  throw last != null ? last : new IOException("Encoder gagal");
+              }
+
+              private void stopPipelineLocked() {
+                  Pipe p = pipe;
+                  pipe = null;
+                  if (p != null) p.shutdown();
+              }
+
+              private final DisplayManager.DisplayListener displayListener = new DisplayManager.DisplayListener() {
+                  @Override
+                  public void onDisplayAdded(int displayId) { }
+
+                  @Override
+                  public void onDisplayRemoved(int displayId) { }
+
+                  @Override
+                  public void onDisplayChanged(int displayId) {
+                      if (displayId != Display.DEFAULT_DISPLAY) return;
+                      synchronized (vlock) {
+                          if (pipe == null || sink == null) return;
+                          int[] r = realSize();
+                          if (r[0] == realW && r[1] == realH) return;
+                          // HP diputar: mulai ulang encoder dengan ukuran baru. Pengendali membaca ukuran baru dari SPS.
+                          stopPipelineLocked();
+                          try {
+                              startPipelineLocked();
+                          } catch (Throwable e) {
+                              lastError = "Gagal mengikuti rotasi layar: " + e.getMessage();
+                              AgentServer s = server;
+                              if (s != null) s.kick();
+                          }
+                      }
+                  }
+              };
+
+              private final class Pipe implements Runnable {
+                  final MediaCodec codec;
+                  final Surface surface;
+                  final AgentServer.Sink out;
+                  final Thread th;
+                  volatile boolean stop;
+
+                  Pipe(int w, int h, int dpi, int bitrate, int fps, AgentServer.Sink out) throws IOException {
+                      this.out = out;
+                      MediaCodec c = null;
+                      Surface s = null;
+                      try {
+                          c = MediaCodec.createEncoderByType("video/avc");
+                          MediaFormat f = MediaFormat.createVideoFormat("video/avc", w, h);
+                          f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+                          f.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+                          f.setInteger(MediaFormat.KEY_FRAME_RATE, 60); // wajib ada, tidak membatasi laju bingkai sebenarnya
+                          f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 5);
+                          f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 500000L); // layar diam tetap mengirim bingkai
+                          if (fps > 0) f.setFloat("max-fps-to-encoder", (float) fps);
+                          c.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                          s = c.createInputSurface();
+                          c.start();
+                      } catch (Throwable e) {
+                          if (s != null) s.release();
+                          if (c != null) {
+                              try { c.release(); } catch (Throwable ignored) { }
+                          }
+                          throw new EncoderException("Encoder video gagal (" + w + "x" + h + "): " + e.getMessage());
+                      }
+                      codec = c;
+                      surface = s;
+                      try {
+                          if (vd == null) {
+                              vd = projection.createVirtualDisplay("cfm-agent", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, s, null, null);
+                              if (vd == null) throw new IOException("Layar virtual gagal dibuat");
+                          } else {
+                              vd.resize(w, h, dpi);
+                              vd.setSurface(s);
+                          }
+                      } catch (Throwable e) {
+                          try { c.stop(); } catch (Throwable ignored) { }
+                          try { c.release(); } catch (Throwable ignored) { }
+                          s.release();
+                          throw new IOException("Tangkap layar ditolak sistem: " + e.getMessage() + ". Hentikan lalu mulai ulang Mode Agen");
+                      }
+                      th = new Thread(this, "agent-enc");
+                      th.setDaemon(true);
+                      th.start();
+                  }
+
+                  void requestSync() {
+                      try {
+                          Bundle b = new Bundle();
+                          b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+                          codec.setParameters(b);
+                      } catch (Throwable ignored) { }
+                  }
+
+                  void shutdown() {
+                      stop = true;
+                      try {
+                          if (vd != null) vd.setSurface(null);
+                      } catch (Throwable ignored) { }
+                      try { th.join(1500); } catch (InterruptedException ignored) { }
+                      try { codec.stop(); } catch (Throwable ignored) { }
+                      try { codec.release(); } catch (Throwable ignored) { }
+                      try { surface.release(); } catch (Throwable ignored) { }
+                  }
+
+                  @Override
+                  public void run() {
+                      MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
+                      try {
+                          while (!stop) {
+                              int i = codec.dequeueOutputBuffer(bi, 100000);
+                              if (i < 0) continue; // belum ada keluaran, atau format berubah
+                              byte[] d = null;
+                              boolean cfg = (bi.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                              boolean key = (bi.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+                              long pts = bi.presentationTimeUs;
+                              try {
+                                  if (bi.size > 0) {
+                                      ByteBuffer b = codec.getOutputBuffer(i);
+                                      if (b != null) {
+                                          d = new byte[bi.size];
+                                          b.position(bi.offset);
+                                          b.limit(bi.offset + bi.size);
+                                          b.get(d);
+                                      }
+                                  }
+                              } finally {
+                                  codec.releaseOutputBuffer(i, false);
+                              }
+                              if (d != null) out.packet(cfg, key, pts, d, 0, d.length);
+                              if ((bi.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+                          }
+                      } catch (IOException e) {
+                          // klien putus: sink sudah menutup sesinya
+                      } catch (Throwable e) {
+                          if (!stop) {
+                              lastError = "Encoder berhenti: " + e.getMessage();
+                              AgentServer s = server;
+                              if (s != null) s.kick();
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentAccess.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Path;
+          import android.hardware.display.DisplayManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+
+          /**
+           * Sisi "tangan" Mode Agen: menjalankan sentuhan, tombol navigasi, dan pengetikan di HP ini atas perintah
+           * pengendali. Memakai layanan Aksesibilitas, jadi tidak perlu root dan tidak perlu ADB. Pengguna harus
+           * mengaktifkannya sekali di Pengaturan > Aksesibilitas.
+           *
+           * Sentuhan direkam dulu (turun, geser, angkat) lalu diputar ulang sebagai satu gestur saat jari diangkat,
+           * karena API gestur Aksesibilitas tidak bisa menerima sentuhan secara langsung.
+           */
+          public final class AgentAccess extends AccessibilityService {
+
+              static volatile AgentAccess instance;
+
+              private static final int MAX_POINTS = 120;
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final Object tl = new Object();
+              private final ArrayList<float[]> pts = new ArrayList<>(); // x, y, waktu relatif (ms)
+              private long downAt;
+              private boolean down;
+
+              // dispatchGesture membatalkan gestur yang sedang berjalan, jadi gestur dikirim satu per satu (hanya di thread utama)
+              private static final int MAX_QUEUE = 6;
+              private final ArrayDeque<Object[]> queue = new ArrayDeque<>(); // {GestureDescription, durasi}
+              private boolean busy;
+              private long busyUntil;
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  instance = this;
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  if (instance == this) instance = null;
+                  return super.onUnbind(intent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (instance == this) instance = null;
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) { }
+
+              @Override
+              public void onInterrupt() { }
+
+              private DisplayMetrics realMetrics() {
+                  DisplayMetrics dm = new DisplayMetrics();
+                  DisplayManager m = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                  Display d = m == null ? null : m.getDisplay(Display.DEFAULT_DISPLAY);
+                  if (d != null) d.getRealMetrics(dm);
+                  else dm = getResources().getDisplayMetrics();
+                  return dm;
+              }
+
+              // ---------- sentuhan ----------
+              /** action 0 turun, 1 angkat, 2 geser. nx, ny: 0..65535 relatif ke layar penuh. */
+              void touch(int action, int nx, int ny) {
+                  if (Build.VERSION.SDK_INT < 24) return; // dispatchGesture baru ada di Android 7
+                  DisplayMetrics dm = realMetrics();
+                  float x = nx / 65535f * (dm.widthPixels - 1);
+                  float y = ny / 65535f * (dm.heightPixels - 1);
+                  long now = SystemClock.uptimeMillis();
+                  ArrayList<float[]> done = null;
+                  float density = dm.density;
+                  synchronized (tl) {
+                      if (action == 0) {
+                          pts.clear();
+                          down = true;
+                          downAt = now;
+                          pts.add(new float[]{x, y, 0});
+                      } else if (!down) {
+                          return;
+                      } else if (action == 2) {
+                          float[] l = pts.get(pts.size() - 1);
+                          float dx = x - l[0], dy = y - l[1];
+                          if (pts.size() < MAX_POINTS * 4 && (dx * dx + dy * dy >= 4f)) pts.add(new float[]{x, y, now - downAt});
+                      } else {
+                          pts.add(new float[]{x, y, now - downAt});
+                          down = false;
+                          done = new ArrayList<>(pts);
+                          pts.clear();
+                      }
+                  }
+                  if (done != null) fire(done, density);
+              }
+
+              private void fire(final ArrayList<float[]> p, float density) {
+                  float[] first = p.get(0);
+                  float[] last = p.get(p.size() - 1);
+                  long elapsed = (long) last[2];
+                  float travel = 0;
+                  for (int i = 1; i < p.size(); i++) {
+                      float dx = p.get(i)[0] - p.get(i - 1)[0], dy = p.get(i)[1] - p.get(i - 1)[1];
+                      travel += (float) Math.sqrt(dx * dx + dy * dy);
+                  }
+                  boolean moved = travel > 10f * density;
+                  Path path = new Path();
+                  path.moveTo(first[0], first[1]);
+                  long dur;
+                  if (!moved) {
+                      // ketukan cepat dibatasi 120 ms (selisih waktu tiba di jaringan bisa menggembung); tekan lama (>= 350 ms) dipertahankan
+                      dur = elapsed < 350 ? Math.max(10, Math.min(elapsed, 120)) : Math.min(5000, elapsed);
+                  } else {
+                      // gesekan diputar lebih cepat dari aslinya supaya terasa responsif dan memicu fling
+                      dur = Math.max(60, Math.min(600, elapsed));
+                      int step = Math.max(1, (p.size() + MAX_POINTS - 1) / MAX_POINTS);
+                      for (int i = 1; i < p.size(); i += step) path.lineTo(p.get(i)[0], p.get(i)[1]);
+                      path.lineTo(last[0], last[1]);
+                  }
+                  final GestureDescription g;
+                  try {
+                      g = new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path, 0, dur)).build();
+                  } catch (RuntimeException e) {
+                      return;
+                  }
+                  final long d = dur;
+                  main.post(() -> {
+                      long now = SystemClock.uptimeMillis();
+                      if (busy && now > busyUntil) busy = false; // callback tidak pernah datang: jangan macet selamanya
+                      if (queue.size() >= MAX_QUEUE) queue.pollFirst();
+                      queue.addLast(new Object[]{g, d});
+                      pump();
+                  });
+              }
+
+              private void pump() {
+                  if (busy) return;
+                  Object[] j = queue.pollFirst();
+                  if (j == null) return;
+                  busy = true;
+                  busyUntil = SystemClock.uptimeMillis() + (Long) j[1] + 1500;
+                  boolean ok;
+                  try {
+                      ok = dispatchGesture((GestureDescription) j[0], new GestureResultCallback() {
+                          @Override
+                          public void onCompleted(GestureDescription gd) {
+                              busy = false;
+                              pump();
+                          }
+
+                          @Override
+                          public void onCancelled(GestureDescription gd) {
+                              busy = false;
+                              pump();
+                          }
+                      }, main);
+                  } catch (Throwable e) {
+                      ok = false;
+                  }
+                  if (!ok) {
+                      busy = false;
+                      pump();
+                  }
+              }
+
+              // ---------- tombol ----------
+              /** @return true bila tombol ini ditangani oleh layanan Aksesibilitas. */
+              boolean key(final int code) {
+                  final int action;
+                  switch (code) {
+                      case 3:
+                          action = GLOBAL_ACTION_HOME;
+                          break;
+                      case 4:
+                          action = GLOBAL_ACTION_BACK;
+                          break;
+                      case 187:
+                          action = GLOBAL_ACTION_RECENTS;
+                          break;
+                      default:
+                          return false;
+                  }
+                  main.post(() -> {
+                      try {
+                          performGlobalAction(action);
+                      } catch (Throwable ignored) { }
+                  });
+                  return true;
+              }
+
+              /** Kunci layar (Android 9+). false bila tidak didukung. */
+              boolean lockScreen() {
+                  if (Build.VERSION.SDK_INT < 28) return false;
+                  main.post(() -> {
+                      try {
+                          performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN);
+                      } catch (Throwable ignored) { }
+                  });
+                  return true;
+              }
+
+              // ---------- teks ----------
+              /** Tambahkan teks ke kolom yang sedang fokus. */
+              void type(final String s) {
+                  main.post(() -> {
+                      AccessibilityNodeInfo root = null, f = null;
+                      try {
+                          root = getRootInActiveWindow();
+                          if (root == null) return;
+                          f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                          if (f == null || !f.isEditable()) return;
+                          CharSequence cur = f.getText();
+                          boolean hint = Build.VERSION.SDK_INT >= 26 && f.isShowingHintText();
+                          String base = (cur == null || hint || f.isPassword()) ? "" : cur.toString();
+                          Bundle b = new Bundle();
+                          b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, base + s);
+                          f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+                      } catch (Throwable ignored) {
+                      } finally {
+                          try { if (f != null) f.recycle(); } catch (Throwable ignored) { }
+                          try { if (root != null) root.recycle(); } catch (Throwable ignored) { }
+                      }
+                  });
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentActivity.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.List;
+
+          /**
+           * Layar Mode Agen untuk HP farm. Buka dari ikon "CFM Agen", aktifkan Aksesibilitas, lalu ketuk Mulai.
+           * Setelah itu HP pengendali menemukan HP ini lewat Pindai WiFi dan menyambung dengan PIN di layar ini.
+           */
+          public final class AgentActivity extends Activity {
+
+              private static final int REQ_PROJ = 41, REQ_NOTIF = 42;
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private TextView accessState, accessNote, shareState, addrTv, pinTv, clientTv, errTv;
+              private TextView accessBtn, shareBtn;
+
+              private final Runnable tick = new Runnable() {
+                  @Override
+                  public void run() {
+                      refresh();
+                      ui.postDelayed(this, 1000);
+                  }
+              };
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private TextView tv(String s, float sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setLineSpacing(0f, 1.18f);
+                  return t;
+              }
+
+              private GradientDrawable box(int color, int radiusDp, int stroke) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(dp(radiusDp));
+                  if (stroke != 0) g.setStroke(dp(1), stroke);
+                  return g;
+              }
+
+              private TextView button(String s, boolean primary, View.OnClickListener l) {
+                  TextView b = tv(s, 14.5f, primary ? 0xFF0B0E14 : MainActivity.FG, true);
+                  b.setGravity(Gravity.CENTER);
+                  b.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  b.setBackground(primary ? box(MainActivity.ACC, 14, 0) : box(MainActivity.CARD2, 14, MainActivity.LINE));
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private LinearLayout card(String title) {
+                  LinearLayout c = new LinearLayout(this);
+                  c.setOrientation(LinearLayout.VERTICAL);
+                  c.setPadding(dp(16), dp(14), dp(16), dp(16));
+                  c.setBackground(box(MainActivity.CARD, 18, MainActivity.LINE));
+                  TextView t = tv(title, 15.5f, MainActivity.FG, true);
+                  t.setPadding(0, 0, 0, dp(6));
+                  c.addView(t);
+                  return c;
+              }
+
+              private void add(LinearLayout parent, View v, int topDp) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                  lp.topMargin = dp(topDp);
+                  parent.addView(v, lp);
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  setTitle("CFM Agen");
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(MainActivity.BG);
+                  sv.setFillViewport(false);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(22), dp(16), dp(28));
+                  sv.addView(root, new ScrollView.LayoutParams(-1, -2));
+
+                  root.addView(tv("Mode Agen", 24, MainActivity.FG, true));
+                  TextView sub = tv("Jadikan HP ini bisa dilihat dan dikontrol dari HP pengendali lewat WiFi. "
+                          + "Tanpa PC, tanpa kabel OTG, tanpa root.", 13.5f, MainActivity.DIM, false);
+                  sub.setPadding(0, dp(4), 0, dp(4));
+                  root.addView(sub);
+
+                  // langkah 1: aksesibilitas
+                  LinearLayout c1 = card("1 · Izinkan sentuhan");
+                  accessState = tv("", 14, MainActivity.DIM, true);
+                  c1.addView(accessState);
+                  TextView d1 = tv("Layanan Aksesibilitas \"CFM Agen\" dipakai untuk menyentuh layar, menekan Home/Kembali, dan mengetik "
+                          + "atas perintah HP pengendali. Tanpa ini layar tetap tampil tetapi tidak bisa disentuh.", 12.5f, MainActivity.DIM, false);
+                  add(c1, d1, 4);
+                  accessBtn = button("Buka Pengaturan Aksesibilitas", true, v -> openAccessibility());
+                  add(c1, accessBtn, 10);
+                  accessNote = tv("Android 13 ke atas: bila opsi CFM Agen berwarna abu-abu, buka Info aplikasi → titik tiga di kanan atas → "
+                          + "Izinkan pengaturan terbatas, lalu ulangi.", 12, MainActivity.WARN, false);
+                  add(c1, accessNote, 8);
+                  add(c1, button("Buka Info aplikasi", false, v -> openAppInfo()), 8);
+                  add(root, c1, 14);
+
+                  // langkah 2: bagikan layar
+                  LinearLayout c2 = card("2 · Bagikan layar");
+                  shareState = tv("", 14, MainActivity.DIM, true);
+                  c2.addView(shareState);
+                  TextView d2 = tv("Ketuk Mulai lalu pilih Mulai sekarang. Bila Android bertanya apa yang dibagikan, pilih \"Seluruh layar\". "
+                          + "Izin ini harus diberikan lagi setiap HP dinyalakan ulang.", 12.5f, MainActivity.DIM, false);
+                  add(c2, d2, 4);
+                  shareBtn = button("Mulai", true, v -> toggleShare());
+                  add(c2, shareBtn, 10);
+                  errTv = tv("", 12.5f, MainActivity.BAD, false);
+                  add(c2, errTv, 8);
+                  add(root, c2, 12);
+
+                  // sambungan
+                  LinearLayout c3 = card("3 · Sambungkan dari HP pengendali");
+                  TextView d3 = tv("Di HP pengendali buka Phone Farm lalu ketuk Pindai WiFi. HP ini akan ditemukan; masukkan PIN di bawah.",
+                          12.5f, MainActivity.DIM, false);
+                  c3.addView(d3);
+                  addrTv = tv("", 14, MainActivity.FG, false);
+                  add(c3, addrTv, 10);
+                  pinTv = tv("", 30, MainActivity.ACC, true);
+                  pinTv.setLetterSpacing(0.12f);
+                  add(c3, pinTv, 6);
+                  add(c3, button("Ubah PIN", false, v -> pinDialog()), 8);
+                  clientTv = tv("", 13, MainActivity.DIM, true);
+                  add(c3, clientTv, 10);
+                  add(root, c3, 12);
+
+                  // pengaturan + tips
+                  LinearLayout c4 = card("Pengaturan dan tips");
+                  final CheckBox cb = new CheckBox(this);
+                  cb.setText("Jaga layar tetap menyala saat Agen aktif");
+                  cb.setTextColor(MainActivity.FG);
+                  cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                  cb.setChecked(AgentService.keepAwake(this));
+                  cb.setOnCheckedChangeListener((v, on) -> AgentService.setKeepAwake(AgentActivity.this, on));
+                  c4.addView(cb);
+                  TextView tips = tv("• Matikan kunci layar (pilih Tidak ada atau Geser). Layar terkunci PIN tidak bisa dibuka dari jauh.\n"
+                          + "• Colok charger; layar yang menyala terus menguras baterai.\n"
+                          + "• Matikan penghemat baterai untuk aplikasi ini agar Agen tidak dimatikan sistem.\n"
+                          + "• Layar aplikasi yang melarang tangkapan layar (perbankan, DRM) tampil hitam.\n"
+                          + "• Gestur geser diputar ulang setelah jari diangkat, jadi terasa sedikit tertunda.",
+                          12.5f, MainActivity.DIM, false);
+                  add(c4, tips, 8);
+                  add(root, c4, 12);
+
+                  setContentView(sv);
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  ui.post(tick);
+              }
+
+              @Override
+              protected void onPause() {
+                  ui.removeCallbacks(tick);
+                  super.onPause();
+              }
+
+              private boolean accessibilityOn() {
+                  if (AgentAccess.instance != null) return true;
+                  try {
+                      String s = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                      if (s == null) return false;
+                      String me = new ComponentName(this, AgentAccess.class).flattenToString();
+                      String shortName = new ComponentName(this, AgentAccess.class).flattenToShortString();
+                      for (String x : s.split(":")) if (x.equalsIgnoreCase(me) || x.equalsIgnoreCase(shortName)) return true;
+                  } catch (Throwable ignored) { }
+                  return false;
+              }
+
+              private void refresh() {
+                  boolean acc = accessibilityOn();
+                  accessState.setText(acc ? "✓ Aktif" : "✗ Belum aktif");
+                  accessState.setTextColor(acc ? MainActivity.OK : MainActivity.WARN);
+                  accessBtn.setVisibility(acc ? View.GONE : View.VISIBLE);
+                  accessNote.setVisibility(acc || Build.VERSION.SDK_INT < 33 ? View.GONE : View.VISIBLE);
+
+                  AgentService s = AgentService.instance;
+                  boolean on = s != null;
+                  shareState.setText(on ? "✓ Berjalan, menunggu atau melayani pengendali" : "○ Belum dimulai");
+                  shareState.setTextColor(on ? MainActivity.OK : MainActivity.DIM);
+                  shareBtn.setText(on ? "Hentikan" : "Mulai");
+                  shareBtn.setBackground(on ? box(MainActivity.CARD2, 14, MainActivity.LINE) : box(MainActivity.ACC, 14, 0));
+                  shareBtn.setTextColor(on ? MainActivity.FG : 0xFF0B0E14);
+                  String err = AgentService.lastError;
+                  errTv.setText(err == null ? "" : err);
+                  errTv.setVisibility(err == null || err.isEmpty() || on ? View.GONE : View.VISIBLE);
+
+                  List<String> ips = AgentService.addresses();
+                  StringBuilder sb = new StringBuilder();
+                  for (String ip : ips) {
+                      if (sb.length() > 0) sb.append("\n");
+                      sb.append(ip).append("  ·  port ").append(AgentWire.PORT);
+                  }
+                  addrTv.setText(ips.isEmpty() ? "Belum tersambung ke WiFi atau hotspot" : "Alamat:\n" + sb);
+                  pinTv.setText(AgentService.pin(this));
+                  if (!on) {
+                      clientTv.setText("");
+                  } else if (s.clientConnected()) {
+                      clientTv.setText("● HP pengendali sedang tersambung");
+                      clientTv.setTextColor(MainActivity.OK);
+                  } else {
+                      clientTv.setText("○ Menunggu HP pengendali");
+                      clientTv.setTextColor(MainActivity.DIM);
+                  }
+              }
+
+              private void openAccessibility() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                      Toast.makeText(this, "Pilih CFM Agen lalu aktifkan", Toast.LENGTH_LONG).show();
+                  } catch (Throwable e) {
+                      Toast.makeText(this, "Tidak bisa membuka pengaturan Aksesibilitas", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void openAppInfo() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+                  } catch (Throwable e) {
+                      Toast.makeText(this, "Tidak bisa membuka Info aplikasi", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void toggleShare() {
+                  if (AgentService.instance != null) {
+                      startService(new Intent(this, AgentService.class).setAction(AgentService.ACTION_STOP));
+                      ui.postDelayed(this::refresh, 400);
+                      return;
+                  }
+                  MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                  if (m == null) {
+                      Toast.makeText(this, "HP ini tidak mendukung tangkap layar", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  if (!accessibilityOn()) {
+                      Toast.makeText(this, "Aksesibilitas belum aktif: layar tampil tetapi tidak bisa disentuh", Toast.LENGTH_LONG).show();
+                  }
+                  try {
+                      startActivityForResult(m.createScreenCaptureIntent(), REQ_PROJ);
+                  } catch (Throwable e) {
+                      Toast.makeText(this, "Gagal meminta izin tangkap layar: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != REQ_PROJ) return;
+                  if (res != RESULT_OK || data == null) {
+                      Toast.makeText(this, "Izin tangkap layar dibatalkan", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  AgentService.lastError = "";
+                  Intent i = new Intent(this, AgentService.class).setAction(AgentService.ACTION_START)
+                          .putExtra(AgentService.EXTRA_CODE, res).putExtra(AgentService.EXTRA_DATA, data);
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                  } catch (Throwable e) {
+                      AgentService.lastError = "Gagal memulai layanan: " + e.getMessage();
+                  }
+                  ui.postDelayed(this::refresh, 500);
+              }
+
+              private void pinDialog() {
+                  final EditText e = new EditText(this);
+                  e.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  e.setText(AgentService.pin(this));
+                  e.setSelectAllOnFocus(true);
+                  e.setTextColor(MainActivity.FG);
+                  e.setPadding(dp(20), dp(14), dp(20), dp(14));
+                  new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                          .setTitle("PIN Agen")
+                          .setMessage("4 sampai 12 angka. Pakai PIN yang sama di semua HP farm agar sekali masuk di HP pengendali.")
+                          .setView(e)
+                          .setPositiveButton("Simpan", (d, w) -> {
+                              String p = e.getText().toString().trim();
+                              if (!p.matches("\\d{4,12}")) {
+                                  Toast.makeText(this, "PIN harus 4 sampai 12 angka", Toast.LENGTH_LONG).show();
+                                  return;
+                              }
+                              AgentService.setPin(this, p);
+                              refresh();
+                          })
+                          .setNegativeButton("Batal", null)
+                          .show();
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/res/xml/agent_access.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/agent_access_desc"
+              android:notificationTimeout="200" />
+          EOF_FILE
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="agent_access_desc">Mengizinkan CFM Agen menyentuh layar, menekan tombol Home/Kembali/Terbaru, dan mengetik atas perintah HP pengendali milik Anda di jaringan yang sama.</string>
+          </resources>
           EOF_FILE
           cat > app/src/main/res/drawable/ic_farm.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>

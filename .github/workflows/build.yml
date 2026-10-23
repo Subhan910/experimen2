@@ -57,8 +57,8 @@ jobs:
                   applicationId 'id.cfm.webui'
                   minSdk 21
                   targetSdk 34
-                  versionCode 13
-                  versionName '3.4'
+                  versionCode 14
+                  versionName '3.5'
               }
 
               signingConfigs {
@@ -90,6 +90,7 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -120,6 +121,7 @@ jobs:
                       android:label="CFM Agen"
                       android:icon="@drawable/ic_launcher"
                       android:exported="true"
+                      android:launchMode="singleTop"
                       android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density|fontScale|layoutDirection">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -527,7 +529,7 @@ jobs:
            */
           public class MainActivity extends Activity {
 
-              private static final String APP_VER = "3.4";
+              private static final String APP_VER = "3.5";
               private static final String HOME_HOST = "192.168.43.1";
               private static final String HOME = "http://192.168.43.1/";
               private static final String NAS_HOME = "http://192.168.43.1:8088/";
@@ -4045,6 +4047,11 @@ jobs:
               final String pin;
               /** Agen terhubung tetapi layanan Aksesibilitasnya belum aktif: layar tampil, sentuhan tidak jalan. */
               volatile boolean noControl;
+              /**
+               * Agen tersambung (sentuhan dan tombol jalan) tetapi layarnya tidak dikirim: belum dibagikan atau direbut aplikasi
+               * lain (mis. Macrorify). state tetap ST_LIVE dan message berisi alasannya. Hanya bermakna saat state == ST_LIVE.
+               */
+              volatile boolean standby;
               volatile String name;
               volatile String model = "";
               volatile int state = ST_IDLE;
@@ -4098,6 +4105,7 @@ jobs:
               }
 
               private void set(int st, String msg) {
+                  if (st != ST_LIVE) standby = false;
                   state = st;
                   message = msg == null ? "" : msg;
                   listener.onChanged(this);
@@ -4320,6 +4328,15 @@ jobs:
                       r.send(agent ? AgentWire.textMsg(part) : textMsg(part), false);
                       i = end;
                   }
+                  return true;
+              }
+
+              /** Agen siaga: minta HP itu membagikan layar lagi (merebutnya dari aplikasi lain). */
+              boolean reclaim() {
+                  Run r = run;
+                  if (!agent || r == null || state != ST_LIVE) return false;
+                  r.send(AgentWire.simpleMsg(AgentWire.C_RECLAIM), false);
+                  if (standby) set(ST_LIVE, "Meminta HP itu membagikan layar...");
                   return true;
               }
 
@@ -4643,7 +4660,8 @@ jobs:
                       vh = hl.height;
                       initCodec(hl.width, hl.height);
                       startAgentControl(dout);
-                      set(ST_LIVE, "");
+                      standby = hl.standby; // pemberitahuan alasan menyusul sebagai paket teks
+                      set(ST_LIVE, hl.standby ? "Layar belum dibagikan di HP itu" : "");
                       decodeLoop(new Frames() {
                           @Override
                           public long readLong() throws IOException {
@@ -4690,11 +4708,25 @@ jobs:
                           if (size == 0) continue; // detak jantung dari Agen
                           byte[] data = new byte[size];
                           vs.readFully(data);
+                          if (agent && (pf & AgentWire.FLAG_NOTICE) != 0) {
+                              // Agen memberi tahu video berhenti (mis. layar direbut Macrorify). Sesi tetap terbuka: sentuhan tetap jalan.
+                              if (size > 1000) throw new IOException("Pemberitahuan Agen rusak");
+                              String msg = new String(data, "UTF-8");
+                              touching = false;
+                              standby = true;
+                              set(ST_LIVE, msg.isEmpty() ? "Layar tidak tersedia" : msg);
+                              continue;
+                          }
                           boolean cfg = (pf & (1L << 63)) != 0;
                           boolean key = (pf & (1L << 62)) != 0;
                           long pts = pf & 0x3FFFFFFFFFFFFFFFL;
 
                           boolean flushFirst = false;
+                          if (cfg && standby) {
+                              // video dilanjutkan setelah layar diambil kembali: konfigurasi baru menandai awal aliran
+                              standby = false;
+                              set(ST_LIVE, "");
+                          }
                           if (cfg) {
                               int[] wh = spsSize(data);
                               if (wh != null && (wh[0] != cw || wh[1] != ch)) {
@@ -5083,6 +5115,11 @@ jobs:
                   }
               }
 
+              /** Warna titik status: Agen siaga (tersambung tanpa layar) berwarna kuning. */
+              private int dotColor(FarmDevice d) {
+                  return d.state == FarmDevice.ST_LIVE && d.standby ? MainActivity.WARN : stateColor(d.state);
+              }
+
               private void each(Each e) {
                   for (FarmDevice d : new ArrayList<>(devs)) e.run(d);
               }
@@ -5161,17 +5198,20 @@ jobs:
               }
 
               private void updateSummary() {
-                  int live = 0, err = 0;
+                  int live = 0, err = 0, sb = 0;
                   for (FarmDevice d : devs) {
-                      if (d.isLive()) live++;
-                      else if (d.state == FarmDevice.ST_ERROR) err++;
+                      if (d.isLive()) {
+                          live++;
+                          if (d.standby) sb++;
+                      } else if (d.state == FarmDevice.ST_ERROR) err++;
                   }
                   if (scanning) {
                       summaryTv.setText("Memindai jaringan (ADB 5555 · Agen 5600)... " + scanDone + "/" + scanTotal);
                   } else if (devs.isEmpty()) {
                       summaryTv.setText("Belum ada HP");
                   } else {
-                      summaryTv.setText(devs.size() + " HP · " + live + " terhubung" + (err > 0 ? " · " + err + " bermasalah" : ""));
+                      summaryTv.setText(devs.size() + " HP · " + live + " terhubung" + (sb > 0 ? " (" + sb + " siaga tanpa layar)" : "")
+                              + (err > 0 ? " · " + err + " bermasalah" : ""));
                   }
                   labelPills();
                   h.farmChanged();
@@ -5495,11 +5535,17 @@ jobs:
                   void refresh() {
                       nameTv.setText(dev.label());
                       hostTv.setText(dev.host + (dev.agent ? " · Agen" : (dev.port != 5555 ? ":" + dev.port : "")));
-                      dotV.setBackground(dot(stateColor(dev.state)));
+                      dotV.setBackground(dot(dotColor(dev)));
                       if (dev.vw > 0 && dev.vh > 0) screen.setRatio(dev.vw / (float) dev.vh);
                       switch (dev.state) {
                           case FarmDevice.ST_LIVE:
-                              status.setVisibility(View.GONE);
+                              if (dev.standby) {
+                                  status.setVisibility(View.VISIBLE);
+                                  status.setTextColor(MainActivity.WARN);
+                                  status.setText("Siaga · layar tidak dikirim\nKetuk untuk kontrol atau Ambil layar");
+                              } else {
+                                  status.setVisibility(View.GONE);
+                              }
                               break;
                           case FarmDevice.ST_CONNECTING:
                               status.setVisibility(View.VISIBLE);
@@ -5520,20 +5566,31 @@ jobs:
               }
 
               private void tileMenu(final FarmDevice d) {
-                  final CharSequence[] it = {"Buka kontrol", "Mulai ulang", "Perintah shell", "Ubah nama / alamat", "Hapus dari daftar"};
-                  h.new Dlg(h).setTitle(d.label()).setItems(it, (dlg, i) -> {
-                      if (i == 0) {
+                  final boolean canReclaim = d.agent && d.state == FarmDevice.ST_LIVE && d.standby;
+                  final List<String> items = new ArrayList<>();
+                  items.add("Buka kontrol");
+                  if (canReclaim) items.add("Ambil layar");
+                  items.add("Mulai ulang");
+                  items.add("Perintah shell");
+                  items.add("Ubah nama / alamat");
+                  items.add("Hapus dari daftar");
+                  final String[] arr = items.toArray(new String[0]);
+                  h.new Dlg(h).setTitle(d.label()).setItems(arr, (dlg, i) -> {
+                      String what = arr[i];
+                      if (what.equals("Buka kontrol")) {
                           openDetail(d);
-                      } else if (i == 1) {
+                      } else if (what.equals("Ambil layar")) {
+                          reclaimScreen(d);
+                      } else if (what.equals("Mulai ulang")) {
                           Tile t = tiles.get(d);
                           d.invalidate();
                           if (t != null) t.retries = 0;
                           if (t != null && t.surface != null && active && detail == null) d.start(t.surface, GRID[quality]);
-                      } else if (i == 2) {
+                      } else if (what.equals("Perintah shell")) {
                           List<FarmDevice> one = new ArrayList<>();
                           one.add(d);
                           shellDialog(one, d.label());
-                      } else if (i == 3) {
+                      } else if (what.equals("Ubah nama / alamat")) {
                           editDialog(d);
                       } else {
                           removeDevice(d);
@@ -5579,6 +5636,12 @@ jobs:
                   if (sync) for (FarmDevice d : devs) if (d != main) d.touch(act, nx, ny);
               }
 
+              /** Agen siaga: minta HP farm membagikan layar lagi. */
+              private void reclaimScreen(FarmDevice d) {
+                  if (d.reclaim()) h.toast("Meminta layar dari " + d.label() + ". Bila dialog muncul di HP itu, ketuk Mulai sekarang");
+                  else h.toast("HP belum tersambung");
+              }
+
               private void sendKey(final FarmDevice main, final int code) {
                   main.key(code);
                   if (sync) for (FarmDevice d : devs) if (d != main) d.key(code);
@@ -5589,7 +5652,7 @@ jobs:
                   final LinearLayout page;
                   final Fit screen;
                   final TextureView tv;
-                  final TextView status, titleTv, subTv, banner;
+                  final TextView status, titleTv, subTv, banner, reclaimBtn;
                   final View dotV;
                   final TextView syncChip;
                   Surface surface;
@@ -5657,6 +5720,11 @@ jobs:
                       status.setGravity(Gravity.CENTER);
                       status.setPadding(dp(24), dp(24), dp(24), dp(24));
                       screen.addView(status, new FrameLayout.LayoutParams(-1, -1));
+                      reclaimBtn = pill("Ambil layar", true, v -> reclaimScreen(dev));
+                      FrameLayout.LayoutParams rp = new FrameLayout.LayoutParams(-2, dp(40), Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM);
+                      rp.bottomMargin = dp(24);
+                      reclaimBtn.setVisibility(View.GONE);
+                      screen.addView(reclaimBtn, rp);
                       page.addView(screen, new LinearLayout.LayoutParams(-1, 0, 1));
 
                       LinearLayout nav1 = new LinearLayout(h);
@@ -5756,7 +5824,7 @@ jobs:
                   void refresh() {
                       titleTv.setText(dev.label());
                       subTv.setText(dev.host + (dev.vw > 0 ? " · " + dev.vw + "×" + dev.vh : ""));
-                      dotV.setBackground(dot(stateColor(dev.state)));
+                      dotV.setBackground(dot(dotColor(dev)));
                       if (dev.vw > 0 && dev.vh > 0) screen.setRatio(dev.vw / (float) dev.vh);
                       syncChip.setText(sync ? "Sinkron: Hidup" : "Sinkron: Mati");
                       pillOn(syncChip, sync);
@@ -5768,9 +5836,20 @@ jobs:
                       } else {
                           banner.setVisibility(View.GONE);
                       }
+                      boolean sb = dev.state == FarmDevice.ST_LIVE && dev.standby;
+                      reclaimBtn.setVisibility(sb ? View.VISIBLE : View.GONE);
+                      status.setBackgroundColor(sb ? 0xB005070B : 0x00000000);
                       switch (dev.state) {
                           case FarmDevice.ST_LIVE:
-                              status.setVisibility(View.GONE);
+                              if (sb) {
+                                  status.setVisibility(View.VISIBLE);
+                                  status.setTextColor(MainActivity.WARN);
+                                  status.setText("Siaga: layar tidak dikirim\n\n" + dev.message
+                                          + "\n\nSentuhan dan tombol di bawah tetap berjalan. Ambil layar meminta HP itu membagikan layar lagi "
+                                          + "(layar direbut dari aplikasi yang memakainya, mis. Macrorify).");
+                              } else {
+                                  status.setVisibility(View.GONE);
+                              }
                               break;
                           case FarmDevice.ST_ERROR:
                               status.setVisibility(View.VISIBLE);
@@ -6224,7 +6303,8 @@ jobs:
                       return;
                   }
                   final CharSequence[] it = {"Home ke semua HP", "Kembali ke semua HP", "Aplikasi terbaru ke semua HP",
-                          "Tombol daya ke semua HP", "Jalankan perintah shell...", "Sambungkan ulang semua", "Hentikan semua"};
+                          "Tombol daya ke semua HP", "Jalankan perintah shell...", "Sambungkan ulang semua", "Hentikan semua",
+                          "Ambil layar di semua Agen yang siaga"};
                   h.new Dlg(h).setTitle("Semua HP").setItems(it, (dlg, i) -> {
                       if (i <= 3) {
                           final int code = i == 0 ? FarmDevice.KEY_HOME : i == 1 ? FarmDevice.KEY_BACK : i == 2 ? FarmDevice.KEY_RECENTS : FarmDevice.KEY_POWER;
@@ -6241,8 +6321,12 @@ jobs:
                                   if (active && t != null && t.surface != null) d.start(t.surface, GRID[quality]);
                               }
                           }
-                      } else {
+                      } else if (i == 6) {
                           each(d -> d.stop());
+                      } else {
+                          int n = 0;
+                          for (FarmDevice d : devs) if (d.agent && d.state == FarmDevice.ST_LIVE && d.standby && d.reclaim()) n++;
+                          h.toast(n == 0 ? "Tidak ada Agen yang siaga" : "Meminta layar dari " + n + " HP");
                       }
                   }).show();
               }
@@ -6317,16 +6401,29 @@ jobs:
                           + "• Gestur geser diputar ulang setelah jari diangkat, jadi sedikit tertunda dibanding ADB.\n"
                           + "• Tidak ada perintah shell; tombol Home, Kembali, Terbaru, Daya, Volume, dan ketik teks tetap jalan. "
                           + "Tombol Daya membangunkan layar; mengunci layar hanya bisa di Android 9 ke atas.\n"
-                          + "• Izin tangkap layar harus diberikan lagi setiap HP farm dinyalakan ulang.\n"
+                          + "• Izin tangkap layar harus diberikan lagi setiap HP farm dinyalakan ulang. Selama Aksesibilitas aktif, Agen tetap "
+                          + "menerima sambungan setelah restart (status Siaga); ketuk Ambil layar untuk membagikan layar lagi.\n"
                           + "• Matikan kunci layar di HP farm. Layar terkunci PIN tidak bisa dibuka dari jauh.\n"
                           + "• Aplikasi yang melarang tangkapan layar (perbankan, DRM) tampil hitam.\n"
+                          + "• Dipakai bersama Macrorify atau perekam layar lain: Android hanya mengizinkan SATU tangkap layar. Saat aplikasi lain "
+                          + "mulai menangkap layar, layar CFM berhenti tetapi sambungan tidak putus: status jadi Siaga, sentuhan dan tombol tetap "
+                          + "jalan. Ketuk Ambil layar untuk merebutnya kembali; itu menghentikan tangkap layar aplikasi lain tadi (Macrorify bisa "
+                          + "berhenti). Di Android 13 ke bawah dialog izin di HP farm diterima otomatis bila bisa; bila tidak, ketuk Mulai sekarang di "
+                          + "HP itu atau ketuk pemberitahuan CFM Agen. Android 8-10: centang Jangan tampilkan lagi pada dialog tangkap layar. "
+                          + "Android 10 ke atas: di CFM Agen izinkan Tampil di atas aplikasi lain supaya permintaan dari jauh bisa membuka dialog "
+                          + "sendiri.\n"
+                          + "• Agar CFM dan Macrorify benar-benar jalan bersamaan, sambungkan HP farm lewat ADB (Cara 2 atau 3): jalur itu tidak "
+                          + "memakai tangkap layar Android sehingga tidak bentrok.\n"
                           + "• Putar layar: putar HP farm-nya langsung, tampilan mengikuti.\n"
                           + "• Android 13 ke atas: bila Aksesibilitas abu-abu, buka Info aplikasi → titik tiga → Izinkan pengaturan terbatas.\n\n"
                           + "CARA 2 · PAKAI KABEL OTG (ADB)\n"
                           + "1. Di HP farm: Opsi pengembang → aktifkan Debugging USB, dan sambungkan ke WiFi/hotspot HP ini.\n"
                           + "2. Pasang adaptor OTG di HP ini, sambungkan kabel data ke HP farm.\n"
                           + "3. Ketuk Via USB (OTG). Izinkan akses USB di HP ini; di HP farm ketuk Izinkan debugging.\n"
-                          + "Hasilnya ADB WiFi aktif: sentuhan langsung tanpa jeda dan perintah shell tersedia.\n\n"
+                          + "Hasilnya ADB WiFi aktif: sentuhan langsung tanpa jeda dan perintah shell tersedia.\n"
+                          + "Tidak punya OTG? Bila kedua HP berlubang USB-C, kabel USB-C ke USB-C kadang bisa menggantikannya: setelah "
+                          + "dicolok, di HP ini buka pemberitahuan USB lalu pilih USB dikendalikan oleh Perangkat ini. Belum tentu berhasil, "
+                          + "tergantung HP.\n\n"
                           + "CARA 3 · DENGAN PC\n"
                           + "Colok HP ke komputer, jalankan  adb tcpip 5555  lalu cabut USB. Setelah itu ketuk Pindai WiFi.\n\n"
                           + "Catatan\n"
@@ -6659,7 +6756,8 @@ jobs:
                   }
                   if (targets.isEmpty()) {
                       if (others == 0) {
-                          throw new IOException("Tidak ada perangkat USB. Pasang adaptor OTG di HP ini, sambungkan kabel data ke HP farm, "
+                          throw new IOException("Tidak ada perangkat USB. Pasang adaptor OTG di HP ini (atau kabel USB-C ke USB-C bila kedua HP "
+                                  + "USB-C, lalu pilih USB dikendalikan oleh Perangkat ini di pemberitahuan USB), sambungkan kabel data ke HP farm, "
                                   + "dan pastikan HP farm tidak hanya mengisi daya.");
                       }
                       throw new IOException(others + " perangkat USB terdeteksi (" + otherName + ") tetapi tanpa antarmuka ADB. "
@@ -6795,10 +6893,13 @@ jobs:
            * Jabat tangan:
            *   server -> klien : "CFMA" ver(1) nonce(16)
            *   klien  -> server: SHA-256(nonce + PIN)(32) maxSize(i32) bitrate(i32) fps(i32)
-           *   server -> klien : status(1)  1 = OK, 2 = OK tetapi sentuhan belum aktif, 0 = PIN salah, 3 = galat + teks(u16 + utf8)
-           *   bila OK         : nama(64) codec(i32 = "h264") lebar(i32) tinggi(i32)
+           *   server -> klien : status(1)  1 = OK, 2 = OK tetapi sentuhan belum aktif, 0 = PIN salah, 3 = galat + teks(u16 + utf8),
+           *                     4 / 5 = SIAGA (seperti 1 / 2, tetapi layar belum dibagikan atau direbut aplikasi lain)
+           *   bila OK/siaga   : nama(64) codec(i32 = "h264") lebar(i32) tinggi(i32)
            * Lalu server mengirim paket video seperti scrcpy: pts+flag(i64, bit63 = config, bit62 = keyframe) ukuran(i32) data.
-           * Paket berukuran 0 = detak jantung (diabaikan).
+           * Paket berukuran 0 = detak jantung (diabaikan). Paket dengan bit61 = PEMBERITAHUAN: isinya teks UTF-8 alasan
+           * mengapa video berhenti (sesi masuk siaga dan tetap terbuka; video dilanjutkan di sesi yang sama bila layar
+           * berhasil diambil kembali). Di keadaan siaga sentuhan dan tombol tetap berjalan.
            *
            * Klien -> server (setelah jabat tangan), tiap pesan diawali 1 byte tipe:
            *   1 TOUCH  aksi(u8) x(u16) y(u16)    koordinat 0..65535 relatif ke layar penuh
@@ -6814,8 +6915,10 @@ jobs:
               static final byte[] MAGIC = {'C', 'F', 'M', 'A'};
               static final int CODEC_H264 = 0x68323634;
 
-              static final int ST_BADPIN = 0, ST_OK = 1, ST_OK_NOCONTROL = 2, ST_ERROR = 3;
-              static final int C_TOUCH = 1, C_KEY = 2, C_TEXT = 3, C_SYNC = 4, C_PING = 5;
+              static final int ST_BADPIN = 0, ST_OK = 1, ST_OK_NOCONTROL = 2, ST_ERROR = 3, ST_STANDBY = 4, ST_STANDBY_NOCONTROL = 5;
+              static final int C_TOUCH = 1, C_KEY = 2, C_TEXT = 3, C_SYNC = 4, C_PING = 5, C_RECLAIM = 6;
+              /** Bit penanda paket pemberitahuan teks pada kolom pts+flag. */
+              static final long FLAG_NOTICE = 1L << 61;
               static final int MAX_TEXT = 4000;
 
               private AgentWire() { }
@@ -6825,6 +6928,8 @@ jobs:
                   String name = "";
                   int width, height;
                   boolean control;
+                  /** true = layar belum tersedia (belum dibagikan atau direbut aplikasi lain); sesi tetap terbuka. */
+                  boolean standby;
               }
 
               static byte[] hash(byte[] nonce, String pin) {
@@ -6897,14 +7002,17 @@ jobs:
                       in.readFully(m);
                       throw new IOException(new String(m, "UTF-8"));
                   }
-                  if (st != ST_OK && st != ST_OK_NOCONTROL) throw new IOException("Jawaban Agen tidak dikenal");
+                  if (st != ST_OK && st != ST_OK_NOCONTROL && st != ST_STANDBY && st != ST_STANDBY_NOCONTROL) {
+                      throw new IOException("Jawaban Agen tidak dikenal");
+                  }
                   byte[] name = new byte[64];
                   in.readFully(name);
                   int len = 0;
                   while (len < name.length && name[len] != 0) len++;
                   Hello h = new Hello();
                   h.name = new String(name, 0, len, "UTF-8");
-                  h.control = st == ST_OK;
+                  h.control = st == ST_OK || st == ST_STANDBY;
+                  h.standby = st == ST_STANDBY || st == ST_STANDBY_NOCONTROL;
                   int codec = in.readInt();
                   if (codec != CODEC_H264) throw new IOException("Codec video Agen tidak didukung");
                   h.width = in.readInt();
@@ -6973,13 +7081,29 @@ jobs:
                   void packet(boolean config, boolean key, long ptsUs, byte[] data, int off, int len) throws IOException;
               }
 
+              /** Dilempar Backend.startVideo bila layar belum tersedia: sesi tetap terbuka dalam keadaan siaga. */
+              static final class NoVideoException extends IOException {
+                  NoVideoException(String m) {
+                      super(m);
+                  }
+              }
+
               interface Backend {
                   String deviceName();
+
+                  /** Ukuran layar penuh saat ini {lebar, tinggi}; dipakai sebagai ukuran awal bila sesi masuk siaga. */
+                  int[] screenSize();
+
+                  /** Minta layar dibagikan kembali (mis. membuka dialog izin tangkap layar di HP ini). Harus cepat kembali. */
+                  void reclaim();
 
                   /** true bila sentuhan/tombol bisa dijalankan (layanan Aksesibilitas aktif). */
                   boolean controlReady();
 
-                  /** Mulai menangkap layar. Mengembalikan {lebar, tinggi} video awal. Harus menghentikan aliran sebelumnya. */
+                  /**
+                   * Mulai menangkap layar. Mengembalikan {lebar, tinggi} video awal. Harus menghentikan aliran sebelumnya.
+                   * Melempar NoVideoException bila layar belum tersedia.
+                   */
                   int[] startVideo(int maxSize, int bitrate, int fps, Sink sink) throws IOException;
 
                   /**
@@ -7033,6 +7157,24 @@ jobs:
                   return current != null;
               }
 
+              /** Backend memberi tahu: layar kini tersedia. Bila klien sedang siaga, video dilanjutkan di sesi yang sama. */
+              void videoReady() {
+                  Session s;
+                  synchronized (this) {
+                      s = current;
+                  }
+                  if (s != null) s.resume();
+              }
+
+              /** Backend memberi tahu: layar hilang (sudah dihentikan di sisi backend). Klien masuk siaga + menerima alasannya. */
+              void videoLost(String reason) {
+                  Session s;
+                  synchronized (this) {
+                      s = current;
+                  }
+                  if (s != null) s.lost(reason);
+              }
+
               /** Putuskan klien yang sedang tersambung (mis. encoder mati). Server tetap menerima sambungan baru. */
               void kick() {
                   Session s;
@@ -7078,7 +7220,14 @@ jobs:
                       try {
                           s = server.accept();
                       } catch (IOException e) {
-                          return;
+                          if (closed || server.isClosed()) return;
+                          // galat sementara (mis. kehabisan deskriptor berkas): server berumur panjang, jangan berhenti menerima selamanya
+                          try {
+                              Thread.sleep(250);
+                          } catch (InterruptedException ie) {
+                              return;
+                          }
+                          continue;
                       }
                       Thread t = new Thread(() -> new Session(s).run(), "agent-client");
                       t.setDaemon(true);
@@ -7093,6 +7242,8 @@ jobs:
                   final Object wlock = new Object();
                   volatile boolean dead;
                   volatile long lastWrite;
+                  volatile boolean standby;
+                  int maxSize, bitrate, fps;
                   Thread beat;
                   Thread self;
 
@@ -7123,7 +7274,9 @@ jobs:
 
                           byte[] got = new byte[32];
                           in.readFully(got);
-                          int maxSize = in.readInt(), bitrate = in.readInt(), fps = in.readInt();
+                          maxSize = in.readInt();
+                          bitrate = in.readInt();
+                          fps = in.readInt();
                           if (!MessageDigest.isEqual(got, AgentWire.hash(nonce, pin))) {
                               out.writeByte(AgentWire.ST_BADPIN);
                               out.flush();
@@ -7150,15 +7303,23 @@ jobs:
                           // (yang bisa keluar seketika) menunggu di sini, jadi tidak pernah mendahului header
                           synchronized (wlock) {
                               int[] size;
+                              String notice = null;
                               try {
                                   size = backend.startVideo(maxSize, bitrate, fps, this);
+                                  standby = false;
+                              } catch (NoVideoException e) {
+                                  standby = true;
+                                  notice = e.getMessage();
+                                  size = backend.screenSize();
                               } catch (Throwable e) {
                                   String m = e.getMessage() == null ? e.toString() : e.getMessage();
                                   out.write(AgentWire.errorReply(m));
                                   out.flush();
                                   return;
                               }
-                              out.writeByte(backend.controlReady() ? AgentWire.ST_OK : AgentWire.ST_OK_NOCONTROL);
+                              boolean ctl = backend.controlReady();
+                              out.writeByte(standby ? (ctl ? AgentWire.ST_STANDBY : AgentWire.ST_STANDBY_NOCONTROL)
+                                      : (ctl ? AgentWire.ST_OK : AgentWire.ST_OK_NOCONTROL));
                               byte[] nm = backend.deviceName().getBytes("UTF-8");
                               byte[] name = new byte[64];
                               System.arraycopy(nm, 0, name, 0, Math.min(63, nm.length));
@@ -7168,6 +7329,7 @@ jobs:
                               out.writeInt(size[1]);
                               out.flush();
                               lastWrite = System.currentTimeMillis();
+                              if (standby && notice != null && !notice.isEmpty()) writeNoticeLocked(notice);
                           }
                           startBeat();
                           sock.setSoTimeout((int) idleMs);
@@ -7241,6 +7403,9 @@ jobs:
                                   break;
                               case AgentWire.C_PING:
                                   break;
+                              case AgentWire.C_RECLAIM:
+                                  backend.reclaim();
+                                  break;
                               default:
                                   return; // pesan tidak dikenal: protokol rusak
                           }
@@ -7252,7 +7417,7 @@ jobs:
                       if (dead) throw new IOException("klien putus");
                       try {
                           synchronized (wlock) {
-                              long pf = ptsUs & 0x3FFFFFFFFFFFFFFFL;
+                              long pf = ptsUs & 0x1FFFFFFFFFFFFFFFL; // bit 61 dipakai untuk pemberitahuan
                               if (config) pf |= 1L << 63;
                               if (key) pf |= 1L << 62;
                               out.writeLong(pf);
@@ -7266,6 +7431,372 @@ jobs:
                           throw e;
                       }
                   }
+
+                  /** Menulis pemberitahuan teks. Harus dipanggil dengan memegang wlock. */
+                  void writeNoticeLocked(String msg) throws IOException {
+                      byte[] t = msg.getBytes("UTF-8");
+                      if (t.length > 400) t = java.util.Arrays.copyOf(t, 400);
+                      out.writeLong(AgentWire.FLAG_NOTICE);
+                      out.writeInt(t.length);
+                      out.write(t);
+                      out.flush();
+                      lastWrite = System.currentTimeMillis();
+                  }
+
+                  /** Layar tersedia lagi: lanjutkan video di sesi ini bila sedang siaga. */
+                  void resume() {
+                      synchronized (wlock) {
+                          if (dead || !standby) return;
+                          try {
+                              backend.startVideo(maxSize, bitrate, fps, this);
+                              standby = false;
+                          } catch (NoVideoException e) {
+                              // masih belum tersedia
+                          } catch (Throwable e) {
+                              try {
+                                  writeNoticeLocked("Gagal memulai video: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                              } catch (IOException io) {
+                                  close();
+                              }
+                          }
+                      }
+                  }
+
+                  /** Layar hilang: masuk siaga dan beri tahu klien alasannya. */
+                  void lost(String reason) {
+                      synchronized (wlock) {
+                          if (dead) return;
+                          standby = true;
+                          try {
+                              writeNoticeLocked(reason == null ? "Layar tidak tersedia" : reason);
+                          } catch (IOException e) {
+                              close();
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/id/cfm/webui/AgentHost.java <<'EOF_FILE'
+          package id.cfm.webui;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.hardware.display.DisplayManager;
+          import android.media.AudioManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.SystemClock;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import java.io.IOException;
+          import java.security.SecureRandom;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /**
+           * Pemilik server Agen di HP farm. Server hidup selama layanan Aksesibilitas CFM Agen aktif (sistem
+           * menyalakannya sendiri saat HP menyala) atau selama AgentService berjalan, jadi pengendali tetap bisa
+           * menyambung walau layar sedang direbut aplikasi lain atau belum dibagikan. Dalam keadaan itu sesi masuk
+           * "siaga": sentuhan dan tombol tetap jalan, dan pengendali bisa meminta layar diambil kembali.
+           *
+           * Video disediakan AgentService (MediaProjection); sentuhan/tombol/teks dijalankan AgentAccess.
+           */
+          final class AgentHost implements AgentServer.Backend {
+
+              static final AgentHost I = new AgentHost();
+              private static final Object LOCK = new Object();
+              private static final String CHANNEL_ALERT = "cfm_agent_alert";
+              private static final int NOTIF_RECLAIM = 5601;
+
+              /**
+               * Kabar "layar tersedia" / "layar hilang" diteruskan ke server lewat satu antrean berurutan di thread latar:
+               * penulisan ke soket klien bisa tertahan, dan itu tidak boleh menahan thread utama atau membalik urutan kabar.
+               */
+              private static final ExecutorService EVENTS = Executors.newSingleThreadExecutor(r -> {
+                  Thread t = new Thread(r, "agent-events");
+                  t.setDaemon(true);
+                  return t;
+              });
+
+              private static final Handler MAIN = new Handler(Looper.getMainLooper());
+              private static long lastReclaimAt;
+              private static final Runnable NOTICE_LATER = new Runnable() {
+                  @Override
+                  public void run() {
+                      Context c = app;
+                      AgentService s = AgentService.instance;
+                      if (c != null && (s == null || !s.hasProjection())) postReclaimNotice(c);
+                  }
+              };
+
+              private static Context app;
+              private static AgentServer server;
+              /** Sampai kapan dialog izin tangkap layar boleh diterima otomatis oleh AgentAccess (uptimeMillis). */
+              static volatile long autoAcceptUntil;
+              static volatile String serverError = "";
+
+              private AgentHost() { }
+
+              // ---------- server ----------
+              static void ensure(Context c) {
+                  synchronized (LOCK) {
+                      if (c != null) app = c.getApplicationContext();
+                      if (app == null || server != null) return;
+                      AgentServer s = new AgentServer(I, AgentService.pin(app), AgentWire.PORT);
+                      try {
+                          s.start();
+                          server = s;
+                          serverError = "";
+                      } catch (IOException e) {
+                          serverError = e.getMessage() == null ? e.toString() : e.getMessage();
+                      }
+                  }
+              }
+
+              static boolean serverUp() {
+                  synchronized (LOCK) {
+                      return server != null;
+                  }
+              }
+
+              /** Matikan server bila tidak ada lagi yang membutuhkannya (Aksesibilitas mati dan layanan layar tidak jalan). */
+              static void stopIfIdle() {
+                  AgentServer s = null;
+                  synchronized (LOCK) {
+                      if (server != null && AgentAccess.instance == null && AgentService.instance == null) {
+                          s = server;
+                          server = null;
+                      }
+                  }
+                  if (s != null) s.stop();
+              }
+
+              static void setPin(String pin) {
+                  synchronized (LOCK) {
+                      if (server != null) server.setPin(pin);
+                  }
+              }
+
+              static boolean clientConnected() {
+                  synchronized (LOCK) {
+                      return server != null && server.hasClient();
+                  }
+              }
+
+              private static AgentServer srv() {
+                  synchronized (LOCK) {
+                      return server;
+                  }
+              }
+
+              /** AgentService: layar kini tersedia. Klien yang siaga dilanjutkan videonya (di thread lain, tidak memblokir pemanggil). */
+              static void projectionReady() {
+                  cancelReclaimNotice();
+                  EVENTS.execute(() -> {
+                      AgentServer s = srv();
+                      if (s != null) s.videoReady();
+                  });
+              }
+
+              /** AgentService: layar hilang (sudah dihentikan di sana). Klien masuk siaga dan menerima alasannya. */
+              static void projectionLost(final String reason) {
+                  EVENTS.execute(() -> {
+                      AgentServer s = srv();
+                      if (s != null) s.videoLost(reason);
+                  });
+              }
+
+              static void kick() {
+                  AgentServer s = srv();
+                  if (s != null) s.kick();
+              }
+
+              /** Izinkan AgentAccess menekan tombol "Mulai sekarang" pada dialog izin tangkap layar milik kita. */
+              static void armAutoAccept() {
+                  autoAcceptUntil = SystemClock.uptimeMillis() + 20000;
+                  AgentAccess a = AgentAccess.instance;
+                  if (a != null) a.pollAccept();
+              }
+
+              // ---------- AgentServer.Backend ----------
+              @Override
+              public String deviceName() {
+                  String m = Build.MODEL;
+                  return m == null || m.isEmpty() ? "HP" : m;
+              }
+
+              @Override
+              public boolean controlReady() {
+                  return AgentAccess.instance != null;
+              }
+
+              @Override
+              public int[] screenSize() {
+                  Context c = app;
+                  if (c == null) return new int[]{720, 1280};
+                  DisplayMetrics m = new DisplayMetrics();
+                  DisplayManager d = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
+                  Display disp = d == null ? null : d.getDisplay(Display.DEFAULT_DISPLAY);
+                  if (disp != null) disp.getRealMetrics(m);
+                  else m = c.getResources().getDisplayMetrics();
+                  return new int[]{Math.max(2, m.widthPixels), Math.max(2, m.heightPixels)};
+              }
+
+              private String standbyReason() {
+                  String e = AgentService.lastError;
+                  if (e != null && !e.isEmpty()) return e;
+                  return "Layar belum dibagikan di HP itu";
+              }
+
+              @Override
+              public int[] startVideo(int maxSize, int bitrate, int fps, AgentServer.Sink sink) throws IOException {
+                  AgentService s = AgentService.instance;
+                  if (s == null || !s.hasProjection()) throw new AgentServer.NoVideoException(standbyReason());
+                  return s.startVideo(maxSize, bitrate, fps, sink);
+              }
+
+              @Override
+              public void stopVideo(AgentServer.Sink sink) {
+                  AgentService s = AgentService.instance;
+                  if (s != null) s.stopVideo(sink);
+              }
+
+              @Override
+              public void requestSync() {
+                  AgentService s = AgentService.instance;
+                  if (s != null) s.requestSync();
+              }
+
+              @Override
+              public void touch(int action, int nx, int ny) {
+                  AgentAccess a = AgentAccess.instance;
+                  if (a != null) a.touch(action, nx, ny);
+              }
+
+              @Override
+              public void key(int code) {
+                  Context c = app;
+                  if (c == null) return;
+                  try {
+                      if (code == 24 || code == 25) {
+                          AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                          if (am != null) {
+                              am.adjustStreamVolume(AudioManager.STREAM_MUSIC, code == 24 ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
+                                      AudioManager.FLAG_SHOW_UI);
+                          }
+                      } else if (code == 26) {
+                          power(c);
+                      } else {
+                          AgentAccess a = AgentAccess.instance;
+                          if (a != null) a.key(code);
+                      }
+                  } catch (Throwable ignored) { }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void power(Context c) {
+                  PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                  if (pm == null) return;
+                  if (!pm.isInteractive()) {
+                      PowerManager.WakeLock w = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "cfm:wake");
+                      w.acquire(3000);
+                  } else {
+                      AgentAccess a = AgentAccess.instance;
+                      if (a != null) a.lockScreen();
+                  }
+              }
+
+              @Override
+              public void text(String s) {
+                  AgentAccess a = AgentAccess.instance;
+                  if (a != null) a.type(s);
+              }
+
+              /**
+               * Pengendali meminta layar diambil kembali. Membuka AgentActivity yang meminta izin tangkap layar; dialog
+               * izinnya diterima otomatis oleh AgentAccess bila memungkinkan. Bila sistem menolak membuka layar dari latar
+               * belakang, pemberitahuan "Ambil layar" muncul di HP ini sebagai cadangan.
+               */
+              @Override
+              public void reclaim() {
+                  Context c = app;
+                  if (c == null) return;
+                  AgentService s = AgentService.instance;
+                  if (s != null && s.hasProjection()) {
+                      projectionReady(); // sudah dibagikan: pastikan klien siaga dilanjutkan
+                      return;
+                  }
+                  synchronized (LOCK) {
+                      long now = SystemClock.uptimeMillis();
+                      if (now - lastReclaimAt < 3000) return; // pengendali yang menekan berulang tidak membanjiri HP farm
+                      lastReclaimAt = now;
+                  }
+                  armAutoAccept();
+                  try {
+                      c.startActivity(reclaimIntent(c));
+                  } catch (Throwable ignored) { }
+                  // Android 10+ bisa menolak membuka layar dari latar belakang tanpa memberi kabar (kecuali izin "Tampil di atas
+                  // aplikasi lain" diberikan). Bila layar belum juga dibagikan, pemberitahuan dimunculkan sebagai cadangan.
+                  MAIN.removeCallbacks(NOTICE_LATER);
+                  MAIN.postDelayed(NOTICE_LATER, 3500);
+              }
+
+              /** Token acak yang hanya diketahui aplikasi ini: AgentActivity (yang diekspor) hanya menuruti permintaan ambil-layar yang membawanya. */
+              static String reclaimToken(Context c) {
+                  android.content.SharedPreferences p = AgentService.prefs(c);
+                  String t = p.getString("rtok", "");
+                  if (t.length() < 16) {
+                      byte[] b = new byte[12];
+                      new SecureRandom().nextBytes(b);
+                      StringBuilder sb = new StringBuilder();
+                      for (byte x : b) sb.append(String.format("%02x", x & 0xff));
+                      t = sb.toString();
+                      p.edit().putString("rtok", t).apply();
+                  }
+                  return t;
+              }
+
+              static Intent reclaimIntent(Context c) {
+                  return new Intent(c, AgentActivity.class)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                          .putExtra(AgentActivity.EXTRA_RECLAIM, true)
+                          .putExtra(AgentActivity.EXTRA_TOKEN, reclaimToken(c));
+              }
+
+              private static void postReclaimNotice(Context c) {
+                  try {
+                      NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm == null) return;
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          nm.createNotificationChannel(new NotificationChannel(CHANNEL_ALERT, "Permintaan ambil layar", NotificationManager.IMPORTANCE_HIGH));
+                      }
+                      int imm = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+                      PendingIntent pi = PendingIntent.getActivity(c, 3, reclaimIntent(c), PendingIntent.FLAG_UPDATE_CURRENT | imm);
+                      Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, CHANNEL_ALERT) : new Notification.Builder(c);
+                      b.setContentTitle("CFM Agen: layar diminta")
+                              .setContentText("Ketuk untuk membagikan layar ke HP pengendali")
+                              .setSmallIcon(Build.VERSION.SDK_INT >= 23 ? R.drawable.ic_farm : android.R.drawable.ic_menu_view)
+                              .setContentIntent(pi)
+                              .setAutoCancel(true);
+                      nm.notify(NOTIF_RECLAIM, b.build());
+                  } catch (Throwable ignored) { }
+              }
+
+              static void cancelReclaimNotice() {
+                  MAIN.removeCallbacks(NOTICE_LATER);
+                  Context c = app;
+                  if (c == null) return;
+                  try {
+                      NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.cancel(NOTIF_RECLAIM);
+                  } catch (Throwable ignored) { }
               }
           }
           EOF_FILE
@@ -7283,7 +7814,6 @@ jobs:
           import android.content.pm.ServiceInfo;
           import android.hardware.display.DisplayManager;
           import android.hardware.display.VirtualDisplay;
-          import android.media.AudioManager;
           import android.media.MediaCodec;
           import android.media.MediaCodecInfo;
           import android.media.MediaFormat;
@@ -7310,10 +7840,12 @@ jobs:
           import java.util.List;
 
           /**
-           * Mode Agen di HP farm: menangkap layar (MediaProjection), mengubahnya menjadi H.264, dan melayani HP
-           * pengendali lewat AgentServer (TCP). Sentuhan dan tombol dijalankan oleh AgentAccess.
+           * Mode Agen di HP farm, sisi layar: menangkap layar (MediaProjection) dan mengubahnya menjadi H.264.
+           * Server TCP dimiliki AgentHost (hidup selama Aksesibilitas aktif), bukan layanan ini, supaya HP pengendali
+           * tetap bisa menyambung walau layar direbut aplikasi lain (mis. Macrorify): Android hanya mengizinkan SATU
+           * tangkap layar pada satu waktu. Saat direbut, layanan ini tetap hidup dalam keadaan siaga dan bisa merebut kembali.
            */
-          public final class AgentService extends Service implements AgentServer.Backend {
+          public final class AgentService extends Service {
 
               static final String ACTION_START = "id.cfm.webui.AGENT_START";
               static final String ACTION_STOP = "id.cfm.webui.AGENT_STOP";
@@ -7335,13 +7867,12 @@ jobs:
               private final Object vlock = new Object();
               private HandlerThread ht;
               private Handler hh;
-              private MediaProjection projection;
+              private volatile MediaProjection projection;
               private MediaProjection.Callback pcb;
               private VirtualDisplay vd;
-              private AgentServer server;
               private PowerManager.WakeLock wake;
               private DisplayManager dm;
-              private boolean closing;
+              private volatile boolean closing;
               private Pipe pipe;
               private AgentServer.Sink sink;
               private int reqMax, reqBitrate, reqFps;
@@ -7364,8 +7895,7 @@ jobs:
 
               static void setPin(Context c, String pin) {
                   prefs(c).edit().putString("pin", pin).apply();
-                  AgentService s = instance;
-                  if (s != null && s.server != null) s.server.setPin(pin);
+                  AgentHost.setPin(pin);
               }
 
               static boolean keepAwake(Context c) {
@@ -7395,9 +7925,9 @@ jobs:
                   return out;
               }
 
-              boolean clientConnected() {
-                  AgentServer s = server;
-                  return s != null && s.hasClient();
+              /** true bila layar sedang dibagikan (ada MediaProjection aktif). */
+              boolean hasProjection() {
+                  return projection != null && !closing;
               }
 
               // ---------- siklus hidup ----------
@@ -7413,12 +7943,13 @@ jobs:
                       return START_NOT_STICKY;
                   }
                   if (ACTION_STOP.equals(intent.getAction())) {
+                      lastError = "Berbagi layar dihentikan dari HP itu";
                       shutdown();
                       stopSelf();
                       return START_NOT_STICKY;
                   }
                   if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
-                  if (projection != null) return START_NOT_STICKY; // sudah berjalan
+                  if (hasProjection()) takeover("Berbagi layar dimulai ulang"); // izin baru menggantikan yang lama
                   try {
                       // Android 10+ mewajibkan layanan foreground bertipe mediaProjection sebelum izin tangkap layar dipakai
                       Notification n = notification();
@@ -7428,7 +7959,6 @@ jobs:
                           startForeground(NOTIF_ID, n);
                       }
                       begin(intent.getIntExtra(EXTRA_CODE, 0), (Intent) intent.getParcelableExtra(EXTRA_DATA));
-                      lastError = "";
                   } catch (Throwable e) {
                       lastError = e.getMessage() == null ? e.toString() : e.getMessage();
                       shutdown();
@@ -7446,79 +7976,116 @@ jobs:
               private void begin(int code, Intent data) throws IOException {
                   if (data == null) throw new IOException("Izin tangkap layar tidak diberikan");
                   closing = false;
+                  lastError = "";
                   MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
                   if (m == null) throw new IOException("Tangkap layar tidak tersedia di HP ini");
-                  ht = new HandlerThread("agent-h");
-                  ht.start();
-                  hh = new Handler(ht.getLooper());
-                  MediaProjection p = m.getMediaProjection(code, data);
+                  if (ht == null) {
+                      ht = new HandlerThread("agent-h");
+                      ht.start();
+                      hh = new Handler(ht.getLooper());
+                  }
+                  final MediaProjection p = m.getMediaProjection(code, data);
                   if (p == null) throw new IOException("Izin tangkap layar ditolak");
-                  projection = p;
-                  pcb = new MediaProjection.Callback() {
+                  final MediaProjection.Callback cb = new MediaProjection.Callback() {
                       @Override
                       public void onStop() {
-                          if (closing) return;
-                          lastError = "Berbagi layar dihentikan dari HP ini";
-                          Handler h = hh;
-                          if (h != null) {
-                              h.post(() -> {
-                                  shutdown();
-                                  stopSelf();
-                              });
-                          }
+                          // Sistem menghentikan tangkap layar kita: aplikasi lain (mis. Macrorify) memulai tangkap layar, atau
+                          // pengguna menghentikan berbagi dari bilah status. Jangan mati: masuk siaga supaya bisa direbut kembali.
+                          if (closing || projection != p) return;
+                          takeover("Layar dipakai aplikasi lain (mis. Macrorify) atau berbagi dihentikan di HP itu", p);
                       }
                   };
-                  p.registerCallback(pcb, hh); // wajib didaftarkan sebelum createVirtualDisplay (Android 14)
-
-                  server = new AgentServer(this, pin(this), AgentWire.PORT);
-                  server.start();
-
-                  dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
-                  if (dm != null) dm.registerDisplayListener(displayListener, hh);
-                  applyWake();
-                  instance = this;
+                  // Seluruh perubahan status + kabar ke server dilakukan di dalam monitor, supaya urutan kabar "hilang" dan "tersedia"
+                  // di antrean AgentHost selalu sama dengan urutan perubahan statusnya.
+                  synchronized (this) {
+                      projection = p;
+                      pcb = cb;
+                      p.registerCallback(cb, hh); // wajib didaftarkan sebelum createVirtualDisplay (Android 14)
+                      dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                      if (dm != null) dm.registerDisplayListener(displayListener, hh);
+                      instance = this;
+                      applyWake();
+                      updateNotification();
+                      AgentHost.ensure(this);
+                      AgentHost.projectionReady();
+                  }
               }
 
-              private synchronized void shutdown() {
-                  if (closing) return;
-                  closing = true;
-                  AgentServer s = server;
-                  server = null;
-                  if (s != null) s.stop();
+              /** Lepaskan tangkap layar, encoder, dan layar virtual. Pemanggil harus memegang monitor layanan. */
+              private void releaseLocked() {
                   if (dm != null) {
                       try { dm.unregisterDisplayListener(displayListener); } catch (Throwable ignored) { }
                       dm = null;
                   }
+                  MediaProjection p;
+                  MediaProjection.Callback cb;
                   synchronized (vlock) {
+                      // projection dikosongkan lebih dulu di dalam vlock: startVideo yang menyusul akan melihat "belum ada layar"
+                      // dan tidak membuat layar virtual baru pada projection yang sedang dilepas
+                      p = projection;
+                      cb = pcb;
+                      projection = null;
+                      pcb = null;
                       stopPipelineLocked();
+                      sink = null;
                       if (vd != null) {
                           try { vd.release(); } catch (Throwable ignored) { }
                           vd = null;
                       }
                   }
-                  MediaProjection p = projection;
-                  projection = null;
                   if (p != null) {
-                      try { if (pcb != null) p.unregisterCallback(pcb); } catch (Throwable ignored) { }
+                      try { if (cb != null) p.unregisterCallback(cb); } catch (Throwable ignored) { }
                       try { p.stop(); } catch (Throwable ignored) { }
                   }
-                  if (wake != null) {
-                      try { if (wake.isHeld()) wake.release(); } catch (Throwable ignored) { }
-                      wake = null;
+              }
+
+              /** Layar hilang tetapi layanan tetap hidup (siaga): pengendali diberi tahu dan bisa meminta layar kembali. */
+              private void takeover(String reason) {
+                  takeover(reason, null);
+              }
+
+              /** expect != null: hanya bila projection itu masih yang aktif (kabar lama dari projection yang sudah diganti diabaikan). */
+              private void takeover(String reason, MediaProjection expect) {
+                  synchronized (this) {
+                      if (closing) return;
+                      if (expect != null && projection != expect) return;
+                      lastError = reason;
+                      releaseLocked();
+                      updateNotification();
+                      AgentHost.projectionLost(reason); // hanya mengantre kabar (tidak memblokir)
                   }
-                  try { stopForeground(true); } catch (Throwable ignored) { }
-                  if (ht != null) {
-                      ht.quitSafely();
-                      ht = null;
+              }
+
+              private void shutdown() {
+                  String why;
+                  synchronized (this) {
+                      if (closing) return;
+                      closing = true;
+                      releaseLocked();
+                      if (wake != null) {
+                          try { if (wake.isHeld()) wake.release(); } catch (Throwable ignored) { }
+                          wake = null;
+                      }
+                      try { stopForeground(true); } catch (Throwable ignored) { }
+                      if (ht != null) {
+                          ht.quitSafely();
+                          ht = null;
+                          hh = null;
+                      }
+                      instance = null;
+                      why = lastError == null || lastError.isEmpty() ? "Berbagi layar dihentikan di HP itu" : lastError;
+                      AgentHost.projectionLost(why);
                   }
-                  instance = null;
+                  AgentHost.cancelReclaimNotice();
+                  // Server tetap hidup bila Aksesibilitas masih aktif: pengendali tetap tersambung (siaga) dan bisa meminta layar lagi
+                  AgentHost.stopIfIdle();
               }
 
               @SuppressWarnings("deprecation")
               private synchronized void applyWake() {
                   PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                   if (pm == null) return;
-                  boolean want = keepAwake(this) && projection != null && !closing;
+                  boolean want = keepAwake(this) && !closing && instance == this;
                   if (want && wake == null) {
                       wake = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "cfm:agent");
                       wake.setReferenceCounted(false);
@@ -7541,31 +8108,36 @@ jobs:
                           PendingIntent.FLAG_UPDATE_CURRENT | imm);
                   Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
                   List<String> ips = addresses();
-                  b.setContentTitle("CFM Agen aktif")
-                          .setContentText("Siap dikontrol · " + (ips.isEmpty() ? "" : ips.get(0) + " · ") + "port " + AgentWire.PORT)
+                  boolean live = projection != null;
+                  b.setContentTitle(live ? "CFM Agen aktif" : "CFM Agen siaga")
+                          .setContentText(live ? "Siap dikontrol · " + (ips.isEmpty() ? "" : ips.get(0) + " · ") + "port " + AgentWire.PORT
+                                  : "Layar dipakai aplikasi lain · sentuhan tetap jalan")
                           .setSmallIcon(Build.VERSION.SDK_INT >= 23 ? R.drawable.ic_farm : android.R.drawable.ic_menu_view)
                           .setOngoing(true)
-                          .setContentIntent(open)
-                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Berhenti", stop);
+                          .setContentIntent(open);
+                  if (!live) {
+                      PendingIntent take = PendingIntent.getActivity(this, 2, AgentHost.reclaimIntent(this), PendingIntent.FLAG_UPDATE_CURRENT | imm);
+                      b.addAction(android.R.drawable.ic_menu_view, "Ambil layar", take);
+                  }
+                  b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Berhenti", stop);
                   return b.build();
               }
 
-              // ---------- AgentServer.Backend ----------
-              @Override
-              public String deviceName() {
-                  String m = Build.MODEL;
-                  return m == null || m.isEmpty() ? "HP" : m;
+              private void updateNotification() {
+                  if (closing) return;
+                  try {
+                      NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.notify(NOTIF_ID, notification());
+                  } catch (Throwable ignored) { }
               }
 
-              @Override
-              public boolean controlReady() {
-                  return AgentAccess.instance != null;
-              }
-
-              @Override
-              public int[] startVideo(int maxSize, int bitrate, int fps, AgentServer.Sink s) throws IOException {
+              // ---------- dipanggil AgentHost (Backend) ----------
+              int[] startVideo(int maxSize, int bitrate, int fps, AgentServer.Sink s) throws IOException {
                   synchronized (vlock) {
-                      if (projection == null || closing) throw new IOException("Berbagi layar belum aktif di HP itu");
+                      if (projection == null || closing) {
+                          String e = lastError;
+                          throw new AgentServer.NoVideoException(e == null || e.isEmpty() ? "Layar belum dibagikan di HP itu" : e);
+                      }
                       stopPipelineLocked();
                       reqMax = maxSize;
                       reqBitrate = bitrate;
@@ -7575,8 +8147,7 @@ jobs:
                   }
               }
 
-              @Override
-              public void stopVideo(AgentServer.Sink s) {
+              void stopVideo(AgentServer.Sink s) {
                   synchronized (vlock) {
                       if (s != null && s != sink) return; // sesi lain sudah mengambil alih aliran
                       stopPipelineLocked();
@@ -7584,54 +8155,10 @@ jobs:
                   }
               }
 
-              @Override
-              public void requestSync() {
+              void requestSync() {
                   synchronized (vlock) {
                       if (pipe != null) pipe.requestSync();
                   }
-              }
-
-              @Override
-              public void touch(int action, int nx, int ny) {
-                  AgentAccess a = AgentAccess.instance;
-                  if (a != null) a.touch(action, nx, ny);
-              }
-
-              @Override
-              public void key(int code) {
-                  try {
-                      if (code == 24 || code == 25) {
-                          AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                          if (am != null) {
-                              am.adjustStreamVolume(AudioManager.STREAM_MUSIC, code == 24 ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
-                                      AudioManager.FLAG_SHOW_UI);
-                          }
-                      } else if (code == 26) {
-                          power();
-                      } else {
-                          AgentAccess a = AgentAccess.instance;
-                          if (a != null) a.key(code);
-                      }
-                  } catch (Throwable ignored) { }
-              }
-
-              @SuppressWarnings("deprecation")
-              private void power() {
-                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                  if (pm == null) return;
-                  if (!pm.isInteractive()) {
-                      PowerManager.WakeLock w = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "cfm:wake");
-                      w.acquire(3000);
-                  } else {
-                      AgentAccess a = AgentAccess.instance;
-                      if (a != null) a.lockScreen();
-                  }
-              }
-
-              @Override
-              public void text(String s) {
-                  AgentAccess a = AgentAccess.instance;
-                  if (a != null) a.type(s);
               }
 
               // ---------- tangkap layar + encoder ----------
@@ -7698,8 +8225,7 @@ jobs:
                               startPipelineLocked();
                           } catch (Throwable e) {
                               lastError = "Gagal mengikuti rotasi layar: " + e.getMessage();
-                              AgentServer s = server;
-                              if (s != null) s.kick();
+                              AgentHost.kick();
                           }
                       }
                   }
@@ -7738,8 +8264,10 @@ jobs:
                       codec = c;
                       surface = s;
                       try {
+                          MediaProjection mp = projection;
+                          if (mp == null) throw new AgentServer.NoVideoException("Layar baru saja direbut aplikasi lain");
                           if (vd == null) {
-                              vd = projection.createVirtualDisplay("cfm-agent", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, s, null, null);
+                              vd = mp.createVirtualDisplay("cfm-agent", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, s, null, null);
                               if (vd == null) throw new IOException("Layar virtual gagal dibuat");
                           } else {
                               vd.resize(w, h, dpi);
@@ -7749,6 +8277,7 @@ jobs:
                           try { c.stop(); } catch (Throwable ignored) { }
                           try { c.release(); } catch (Throwable ignored) { }
                           s.release();
+                          if (e instanceof AgentServer.NoVideoException) throw (AgentServer.NoVideoException) e;
                           throw new IOException("Tangkap layar ditolak sistem: " + e.getMessage() + ". Hentikan lalu mulai ulang Mode Agen");
                       }
                       th = new Thread(this, "agent-enc");
@@ -7807,8 +8336,7 @@ jobs:
                       } catch (Throwable e) {
                           if (!stop) {
                               lastError = "Encoder berhenti: " + e.getMessage();
-                              AgentServer s = server;
-                              if (s != null) s.kick();
+                              AgentHost.kick();
                           }
                       }
                   }
@@ -7865,22 +8393,91 @@ jobs:
               protected void onServiceConnected() {
                   super.onServiceConnected();
                   instance = this;
+                  // Sistem menyalakan layanan ini sendiri saat HP menyala, jadi server Agen ikut hidup tanpa membuka aplikasi.
+                  // Pengendali bisa menyambung (siaga) dan meminta layar diambil bahkan setelah HP dinyalakan ulang.
+                  AgentHost.ensure(this);
               }
 
               @Override
               public boolean onUnbind(Intent intent) {
                   if (instance == this) instance = null;
+                  main.removeCallbacks(acceptPoll);
+                  AgentHost.stopIfIdle();
                   return super.onUnbind(intent);
               }
 
               @Override
               public void onDestroy() {
                   if (instance == this) instance = null;
+                  AgentHost.stopIfIdle();
                   super.onDestroy();
               }
 
               @Override
-              public void onAccessibilityEvent(AccessibilityEvent event) { }
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (event != null && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                          && SystemClock.uptimeMillis() < AgentHost.autoAcceptUntil) {
+                      tryAccept();
+                  }
+              }
+
+              // ---------- terima otomatis dialog izin tangkap layar (hanya saat pengendali meminta "Ambil layar") ----------
+              /** Coba terima dialog sekarang, lalu ulangi sebentar bila belum muncul. Hanya aktif selama AgentHost.autoAcceptUntil. */
+              void pollAccept() {
+                  if (Build.VERSION.SDK_INT > 33) return; // Android 14+: dialognya berbeda dan sengaja tidak disentuh
+                  main.post(acceptPoll);
+              }
+
+              private final Runnable acceptPoll = new Runnable() {
+                  @Override
+                  public void run() {
+                      main.removeCallbacks(this);
+                      if (SystemClock.uptimeMillis() >= AgentHost.autoAcceptUntil) return;
+                      if (!tryAccept()) main.postDelayed(this, 400);
+                  }
+              };
+
+              /**
+               * Tekan "Mulai sekarang" pada dialog izin tangkap layar milik sistem. Hanya Android 13 ke bawah (Android 14
+               * memakai dialog pilihan "satu aplikasi / seluruh layar" yang sengaja tidak disentuh), dan hanya jendela
+               * com.android.systemui yang menyebut nama aplikasi ini. Kotak "Jangan tampilkan lagi" tidak pernah dicentang otomatis.
+               */
+              private boolean tryAccept() {
+                  if (Build.VERSION.SDK_INT > 33) return false;
+                  AccessibilityNodeInfo root = null;
+                  try {
+                      root = getRootInActiveWindow();
+                      if (root == null) return false;
+                      CharSequence pkg = root.getPackageName();
+                      if (pkg == null || !"com.android.systemui".contentEquals(pkg)) return false;
+                      // pastikan ini dialog milik aplikasi kita: teks dialog selalu menyebut nama aplikasi yang meminta
+                      String label = getApplicationInfo().loadLabel(getPackageManager()).toString();
+                      java.util.List<AccessibilityNodeInfo> mine = root.findAccessibilityNodeInfosByText(label);
+                      if (mine == null || mine.isEmpty()) return false;
+                      AccessibilityNodeInfo btn = null;
+                      String[] words = {"Mulai sekarang", "Start now", "Mulai", "Start"};
+                      for (String w : words) {
+                          java.util.List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(w);
+                          if (l == null) continue;
+                          for (AccessibilityNodeInfo n : l) {
+                              CharSequence t = n.getText();
+                              if (n.isClickable() && t != null && w.equalsIgnoreCase(t.toString().trim())) {
+                                  btn = n;
+                                  break;
+                              }
+                          }
+                          if (btn != null) break;
+                      }
+                      if (btn == null || !btn.isEnabled()) return false;
+                      boolean ok = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                      if (ok) AgentHost.autoAcceptUntil = 0;
+                      return ok;
+                  } catch (Throwable e) {
+                      return false;
+                  } finally {
+                      try { if (root != null) root.recycle(); } catch (Throwable ignored) { }
+                  }
+              }
 
               @Override
               public void onInterrupt() { }
@@ -8094,10 +8691,16 @@ jobs:
           public final class AgentActivity extends Activity {
 
               private static final int REQ_PROJ = 41, REQ_NOTIF = 42;
+              /** Dikirim AgentHost saat pengendali menekan "Ambil layar": langsung minta izin tangkap layar lalu kembali ke aplikasi sebelumnya. */
+              static final String EXTRA_RECLAIM = "reclaim";
+              /** Token rahasia aplikasi ini (AgentHost.reclaimToken): AgentActivity diekspor, jadi aplikasi lain tidak boleh memicu ambil-layar. */
+              static final String EXTRA_TOKEN = "rtok";
 
               private final Handler ui = new Handler(Looper.getMainLooper());
               private TextView accessState, accessNote, shareState, addrTv, pinTv, clientTv, errTv;
-              private TextView accessBtn, shareBtn;
+              private TextView accessBtn, shareBtn, stopBtn, serverTv;
+              private boolean reclaimMode, capturePending, resumed, wantCapture;
+              private TextView overlayNote, overlayBtn;
 
               private final Runnable tick = new Runnable() {
                   @Override
@@ -8193,10 +8796,13 @@ jobs:
                   shareState = tv("", 14, MainActivity.DIM, true);
                   c2.addView(shareState);
                   TextView d2 = tv("Ketuk Mulai lalu pilih Mulai sekarang. Bila Android bertanya apa yang dibagikan, pilih \"Seluruh layar\". "
-                          + "Izin ini harus diberikan lagi setiap HP dinyalakan ulang.", 12.5f, MainActivity.DIM, false);
+                          + "Izin ini harus diberikan lagi setiap HP dinyalakan ulang. Android 8-10: centang \"Jangan tampilkan lagi\" "
+                          + "di dialog itu supaya tidak perlu mengetuk ulang.", 12.5f, MainActivity.DIM, false);
                   add(c2, d2, 4);
                   shareBtn = button("Mulai", true, v -> toggleShare());
                   add(c2, shareBtn, 10);
+                  stopBtn = button("Hentikan layanan", false, v -> stopService());
+                  add(c2, stopBtn, 8);
                   errTv = tv("", 12.5f, MainActivity.BAD, false);
                   add(c2, errTv, 8);
                   add(root, c2, 12);
@@ -8206,8 +8812,10 @@ jobs:
                   TextView d3 = tv("Di HP pengendali buka Phone Farm lalu ketuk Pindai WiFi. HP ini akan ditemukan; masukkan PIN di bawah.",
                           12.5f, MainActivity.DIM, false);
                   c3.addView(d3);
+                  serverTv = tv("", 13, MainActivity.DIM, true);
+                  add(c3, serverTv, 10);
                   addrTv = tv("", 14, MainActivity.FG, false);
-                  add(c3, addrTv, 10);
+                  add(c3, addrTv, 8);
                   pinTv = tv("", 30, MainActivity.ACC, true);
                   pinTv.setLetterSpacing(0.12f);
                   add(c3, pinTv, 6);
@@ -8216,10 +8824,38 @@ jobs:
                   add(c3, clientTv, 10);
                   add(root, c3, 12);
 
+                  // izin agar Ambil layar dari jauh bisa membuka layar sendiri (Android 10+)
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      LinearLayout c6 = card("Ambil layar dari jauh (Android 10+)");
+                      overlayNote = tv("", 14, MainActivity.DIM, true);
+                      c6.addView(overlayNote);
+                      TextView d6 = tv("Tanpa izin \"Tampil di atas aplikasi lain\", Android 10 ke atas melarang CFM membuka layarnya sendiri dari "
+                              + "latar belakang. Tombol Ambil layar di pengendali tetap berguna, tetapi di HP ini Anda harus mengetuk pemberitahuan "
+                              + "CFM Agen: layar itu muncul sebagai ganti pembukaan otomatis. Dengan izin ini, permintaan dari jauh langsung membuka "
+                              + "dialog tangkap layar.", 12.5f, MainActivity.DIM, false);
+                      add(c6, d6, 4);
+                      overlayBtn = button("Buka pengaturan izin", true, v -> openOverlaySettings());
+                      add(c6, overlayBtn, 10);
+                      add(root, c6, 12);
+                  }
+
+                  // bentrok tangkap layar
+                  LinearLayout c5 = card("Dipakai bersama Macrorify atau perekam layar?");
+                  TextView d5 = tv("Android hanya mengizinkan SATU aplikasi menangkap layar pada satu waktu. Saat Macrorify (atau perekam layar lain) "
+                          + "mulai menangkap layar, tangkapan CFM dihentikan sistem.\n\n"
+                          + "Sekarang CFM tidak ikut putus: HP pengendali tetap tersambung dalam keadaan siaga, sentuhan, Home, Kembali dan "
+                          + "mengetik tetap jalan, dan pesan alasannya tampil di pengendali. Tombol Ambil layar di pengendali (atau di "
+                          + "pemberitahuan HP ini) merebut layar kembali, tetapi itu mengambilnya dari Macrorify, jadi Macrorify bisa berhenti "
+                          + "melihat layar.\n\n"
+                          + "Agar keduanya benar-benar berjalan bersamaan, HP farm perlu disambung lewat ADB WiFi (mode ADB di Phone Farm); "
+                          + "jalur itu tidak memakai tangkap layar ini.", 12.5f, MainActivity.DIM, false);
+                  add(c5, d5, 4);
+                  add(root, c5, 12);
+
                   // pengaturan + tips
                   LinearLayout c4 = card("Pengaturan dan tips");
                   final CheckBox cb = new CheckBox(this);
-                  cb.setText("Jaga layar tetap menyala saat Agen aktif");
+                  cb.setText("Jaga layar tetap menyala saat layanan Agen berjalan");
                   cb.setTextColor(MainActivity.FG);
                   cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
                   cb.setChecked(AgentService.keepAwake(this));
@@ -8228,6 +8864,8 @@ jobs:
                   TextView tips = tv("• Matikan kunci layar (pilih Tidak ada atau Geser). Layar terkunci PIN tidak bisa dibuka dari jauh.\n"
                           + "• Colok charger; layar yang menyala terus menguras baterai.\n"
                           + "• Matikan penghemat baterai untuk aplikasi ini agar Agen tidak dimatikan sistem.\n"
+                          + "• Selama Aksesibilitas aktif, Agen tetap siap menerima sambungan walau HP baru dinyalakan ulang; layar baru "
+                          + "tampil setelah Ambil layar diizinkan (mulai ulang HP menghapus izin tangkap layar).\n"
                           + "• Layar aplikasi yang melarang tangkapan layar (perbankan, DRM) tampil hitam.\n"
                           + "• Gestur geser diputar ulang setelah jari diangkat, jadi terasa sedikit tertunda.",
                           12.5f, MainActivity.DIM, false);
@@ -8235,19 +8873,67 @@ jobs:
                   add(root, c4, 12);
 
                   setContentView(sv);
-                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                  handleIntent(getIntent());
+                  // pada mode ambil-layar tanpa pengawasan, jangan memunculkan dialog izin lain di tengah jalan
+                  if (!reclaimMode && Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                       requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
                   }
               }
 
               @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  handleIntent(intent);
+              }
+
+              /** Pengendali meminta layar kembali: minta izin tangkap layar sekarang (dialognya diterima otomatis bila bisa). */
+              private void handleIntent(Intent in) {
+                  if (in == null || !in.getBooleanExtra(EXTRA_RECLAIM, false)) return;
+                  in.removeExtra(EXTRA_RECLAIM); // jangan terulang bila layar dibuat ulang
+                  String tok = in.getStringExtra(EXTRA_TOKEN);
+                  in.removeExtra(EXTRA_TOKEN);
+                  if (tok == null || !tok.equals(AgentHost.reclaimToken(this))) return; // bukan dari aplikasi ini: abaikan
+                  AgentService s = AgentService.instance;
+                  if (s != null && s.hasProjection()) {
+                      AgentHost.projectionReady();
+                      reclaimMode = true;
+                      leave();
+                      return;
+                  }
+                  reclaimMode = true;
+                  wantCapture = true;
+                  AgentHost.armAutoAccept();
+                  if (resumed) ui.post(this::runWanted);
+              }
+
+              /** Minta izin tangkap layar yang tertunda (setelah layar benar-benar tampil di depan). */
+              private void runWanted() {
+                  if (!wantCapture) return;
+                  wantCapture = false;
+                  requestCapture();
+              }
+
+              /** Kembali ke aplikasi yang sebelumnya di depan (mis. Macrorify), hanya dipakai pada mode "Ambil layar". */
+              private void leave() {
+                  if (!reclaimMode) return;
+                  reclaimMode = false;
+                  try { moveTaskToBack(true); } catch (Throwable ignored) { }
+                  finish();
+              }
+
+              @Override
               protected void onResume() {
                   super.onResume();
+                  resumed = true;
+                  if (accessibilityOn()) AgentHost.ensure(this);
                   ui.post(tick);
+                  if (wantCapture) ui.post(this::runWanted);
               }
 
               @Override
               protected void onPause() {
+                  resumed = false;
                   ui.removeCallbacks(tick);
                   super.onPause();
               }
@@ -8272,15 +8958,42 @@ jobs:
                   accessNote.setVisibility(acc || Build.VERSION.SDK_INT < 33 ? View.GONE : View.VISIBLE);
 
                   AgentService s = AgentService.instance;
-                  boolean on = s != null;
-                  shareState.setText(on ? "✓ Berjalan, menunggu atau melayani pengendali" : "○ Belum dimulai");
-                  shareState.setTextColor(on ? MainActivity.OK : MainActivity.DIM);
-                  shareBtn.setText(on ? "Hentikan" : "Mulai");
-                  shareBtn.setBackground(on ? box(MainActivity.CARD2, 14, MainActivity.LINE) : box(MainActivity.ACC, 14, 0));
-                  shareBtn.setTextColor(on ? MainActivity.FG : 0xFF0B0E14);
+                  boolean live = s != null && s.hasProjection();
+                  boolean standby = s != null && !live;
+                  if (live) {
+                      shareState.setText("✓ Layar dibagikan");
+                      shareState.setTextColor(MainActivity.OK);
+                  } else if (standby) {
+                      shareState.setText("◐ Siaga: layar tidak dibagikan");
+                      shareState.setTextColor(MainActivity.WARN);
+                  } else {
+                      shareState.setText("○ Layar belum dibagikan");
+                      shareState.setTextColor(MainActivity.DIM);
+                  }
+                  shareBtn.setText(live ? "Hentikan" : (standby ? "Ambil layar" : "Mulai"));
+                  shareBtn.setBackground(live ? box(MainActivity.CARD2, 14, MainActivity.LINE) : box(MainActivity.ACC, 14, 0));
+                  shareBtn.setTextColor(live ? MainActivity.FG : 0xFF0B0E14);
+                  stopBtn.setVisibility(standby ? View.VISIBLE : View.GONE);
+                  if (overlayNote != null) {
+                      boolean ov = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this);
+                      overlayNote.setText(ov ? "✓ Diizinkan" : "○ Belum diizinkan");
+                      overlayNote.setTextColor(ov ? MainActivity.OK : MainActivity.WARN);
+                      overlayBtn.setVisibility(ov ? View.GONE : View.VISIBLE);
+                  }
                   String err = AgentService.lastError;
                   errTv.setText(err == null ? "" : err);
-                  errTv.setVisibility(err == null || err.isEmpty() || on ? View.GONE : View.VISIBLE);
+                  errTv.setVisibility(err == null || err.isEmpty() || live ? View.GONE : View.VISIBLE);
+
+                  if (AgentHost.serverUp()) {
+                      serverTv.setText("● Server Agen siap (port " + AgentWire.PORT + ")");
+                      serverTv.setTextColor(MainActivity.OK);
+                  } else if (!AgentHost.serverError.isEmpty()) {
+                      serverTv.setText("✗ Server gagal dibuka: " + AgentHost.serverError);
+                      serverTv.setTextColor(MainActivity.BAD);
+                  } else {
+                      serverTv.setText("○ Server Agen mati. Aktifkan Aksesibilitas atau ketuk Mulai");
+                      serverTv.setTextColor(MainActivity.DIM);
+                  }
 
                   List<String> ips = AgentService.addresses();
                   StringBuilder sb = new StringBuilder();
@@ -8290,11 +9003,11 @@ jobs:
                   }
                   addrTv.setText(ips.isEmpty() ? "Belum tersambung ke WiFi atau hotspot" : "Alamat:\n" + sb);
                   pinTv.setText(AgentService.pin(this));
-                  if (!on) {
+                  if (!AgentHost.serverUp()) {
                       clientTv.setText("");
-                  } else if (s.clientConnected()) {
-                      clientTv.setText("● HP pengendali sedang tersambung");
-                      clientTv.setTextColor(MainActivity.OK);
+                  } else if (AgentHost.clientConnected()) {
+                      clientTv.setText(live ? "● HP pengendali sedang tersambung" : "◐ HP pengendali tersambung (menunggu layar)");
+                      clientTv.setTextColor(live ? MainActivity.OK : MainActivity.WARN);
                   } else {
                       clientTv.setText("○ Menunggu HP pengendali");
                       clientTv.setTextColor(MainActivity.DIM);
@@ -8310,6 +9023,14 @@ jobs:
                   }
               }
 
+              private void openOverlaySettings() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                  } catch (Throwable e) {
+                      openAppInfo();
+                  }
+              }
+
               private void openAppInfo() {
                   try {
                       startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
@@ -8318,24 +9039,51 @@ jobs:
                   }
               }
 
+              private void stopService() {
+                  startService(new Intent(this, AgentService.class).setAction(AgentService.ACTION_STOP));
+                  ui.postDelayed(this::refresh, 400);
+              }
+
               private void toggleShare() {
-                  if (AgentService.instance != null) {
-                      startService(new Intent(this, AgentService.class).setAction(AgentService.ACTION_STOP));
-                      ui.postDelayed(this::refresh, 400);
+                  AgentService s = AgentService.instance;
+                  if (s != null && s.hasProjection()) {
+                      stopService();
+                      return;
+                  }
+                  requestCapture();
+              }
+
+              private void requestCapture() {
+                  if (capturePending) return;
+                  AgentService cur = AgentService.instance;
+                  if (cur != null && cur.hasProjection()) {
+                      leave();
                       return;
                   }
                   MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
                   if (m == null) {
                       Toast.makeText(this, "HP ini tidak mendukung tangkap layar", Toast.LENGTH_LONG).show();
+                      if (reclaimMode) {
+                          AgentService.lastError = "HP itu tidak mendukung tangkap layar";
+                          AgentHost.projectionLost(AgentService.lastError);
+                          leave();
+                      }
                       return;
                   }
                   if (!accessibilityOn()) {
                       Toast.makeText(this, "Aksesibilitas belum aktif: layar tampil tetapi tidak bisa disentuh", Toast.LENGTH_LONG).show();
                   }
                   try {
+                      capturePending = true;
                       startActivityForResult(m.createScreenCaptureIntent(), REQ_PROJ);
                   } catch (Throwable e) {
+                      capturePending = false;
                       Toast.makeText(this, "Gagal meminta izin tangkap layar: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      if (reclaimMode) {
+                          AgentService.lastError = "Gagal meminta izin tangkap layar di HP itu";
+                          AgentHost.projectionLost(AgentService.lastError);
+                          leave();
+                      }
                   }
               }
 
@@ -8343,8 +9091,15 @@ jobs:
               protected void onActivityResult(int req, int res, Intent data) {
                   super.onActivityResult(req, res, data);
                   if (req != REQ_PROJ) return;
+                  capturePending = false;
                   if (res != RESULT_OK || data == null) {
                       Toast.makeText(this, "Izin tangkap layar dibatalkan", Toast.LENGTH_LONG).show();
+                      if (reclaimMode) {
+                          AgentService.lastError = "Permintaan ambil layar dibatalkan di HP itu";
+                          AgentHost.cancelReclaimNotice();
+                          AgentHost.projectionLost(AgentService.lastError);
+                          leave();
+                      }
                       return;
                   }
                   AgentService.lastError = "";
@@ -8355,8 +9110,10 @@ jobs:
                       else startService(i);
                   } catch (Throwable e) {
                       AgentService.lastError = "Gagal memulai layanan: " + e.getMessage();
+                      if (reclaimMode) AgentHost.projectionLost(AgentService.lastError);
                   }
                   ui.postDelayed(this::refresh, 500);
+                  leave();
               }
 
               private void pinDialog() {

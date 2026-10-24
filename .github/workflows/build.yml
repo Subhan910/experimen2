@@ -57,8 +57,8 @@ jobs:
                   applicationId 'id.cfm.webui'
                   minSdk 21
                   targetSdk 34
-                  versionCode 15
-                  versionName '3.5.1'
+                  versionCode 16
+                  versionName '3.6'
               }
 
               signingConfigs {
@@ -95,6 +95,19 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+              <!-- Android 11+: agar daftar aplikasi dan nama aplikasi yang dimatikan sebelum Ambil layar (mis. Macrorify) terbaca -->
+              <queries>
+                  <package android:name="com.kok_emm.mobile" />
+                  <intent>
+                      <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+                      <data android:scheme="package" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
 
               <application
                   android:allowBackup="true"
@@ -529,7 +542,7 @@ jobs:
            */
           public class MainActivity extends Activity {
 
-              private static final String APP_VER = "3.5.1";
+              private static final String APP_VER = "3.6";
               private static final String HOME_HOST = "192.168.43.1";
               private static final String HOME = "http://192.168.43.1/";
               private static final String NAS_HOME = "http://192.168.43.1:8088/";
@@ -5850,8 +5863,8 @@ jobs:
                                   status.setVisibility(View.VISIBLE);
                                   status.setTextColor(MainActivity.WARN);
                                   status.setText("Siaga: layar tidak dikirim\n\n" + dev.message
-                                          + "\n\nSentuhan dan tombol di bawah tetap berjalan. Ambil layar meminta HP itu membagikan layar lagi "
-                                          + "(layar direbut dari aplikasi yang memakainya, mis. Macrorify).");
+                                          + "\n\nSentuhan dan tombol di bawah tetap berjalan. Ambil layar meminta HP itu membagikan layar lagi; "
+                                          + "bila diatur di HP itu, aplikasi yang merebut layar (mis. Macrorify) dimatikan paksa dulu.");
                               } else {
                                   status.setVisibility(View.GONE);
                               }
@@ -6415,7 +6428,10 @@ jobs:
                           + "jalan. Ketuk Ambil layar untuk merebutnya kembali; itu menghentikan tangkap layar aplikasi lain tadi (Macrorify bisa "
                           + "berhenti). Di Android 13 ke bawah dialog izin di HP farm diterima otomatis bila bisa; bila tidak, ketuk Mulai sekarang di "
                           + "HP itu atau ketuk pemberitahuan CFM Agen. Android 8-10: centang Jangan tampilkan lagi pada dialog tangkap layar. "
-                          + "Android 10 ke atas: di CFM Agen izinkan Tampil di atas aplikasi lain supaya permintaan dari jauh bisa membuka dialog "
+                          + "Ambil layar otomatis mematikan paksa Macrorify lebih dulu (HP farm membuka Info aplikasi lalu menekan Paksa berhenti); "
+                          + "aplikasinya bisa diganti atau dimatikan di kartu Matikan aplikasi di CFM Agen. Setelah itu jalankan lagi Macrorify-nya, "
+                          + "dan bila botnya tidak mengklik, aktifkan lagi Aksesibilitas Macrorify.\n"
+                          + "• Android 10 ke atas: di CFM Agen izinkan Tampil di atas aplikasi lain supaya permintaan dari jauh bisa membuka dialog "
                           + "sendiri. Bila bot di HP farm menekan Kembali terus-menerus, Ambil layar mencoba ulang otomatis sampai 45 detik "
                           + "dan layar CFM Agen mengabaikan tombol Kembali selama itu; progresnya tampil di layar kontrol.\n"
                           + "• Agar CFM dan Macrorify benar-benar jalan bersamaan, sambungkan HP farm lewat ADB (Cara 2 atau 3): jalur itu tidak "
@@ -7548,6 +7564,12 @@ jobs:
               static volatile long autoAcceptUntil;
               /** Keterangan singkat percobaan klik otomatis terakhir (ditampilkan di layar CFM Agen untuk diagnosa). */
               static volatile String acceptDiag = "";
+              /** Keterangan singkat percobaan "matikan aplikasi" terakhir (ditampilkan di layar CFM Agen untuk diagnosa). */
+              static volatile String stopDiag = "";
+              /** Aplikasi yang dimatikan paksa sebelum "Ambil layar" (Macrorify memakai tangkap layar dan merebutnya kembali). */
+              static final String DEFAULT_STOP_PKG = "com.kok_emm.mobile";
+              /** true selama satu rangkaian "Ambil layar" berjalan (matikan aplikasi, dialog izin, coba ulang) sampai layar tiba atau menyerah. */
+              private static volatile boolean reclaiming;
               static volatile String serverError = "";
 
               private AgentHost() { }
@@ -7607,6 +7629,7 @@ jobs:
               /** AgentService: layar kini tersedia. Klien yang siaga dilanjutkan videonya (di thread lain, tidak memblokir pemanggil). */
               static void projectionReady() {
                   autoAcceptUntil = 0;
+                  reclaiming = false;
                   cancelReclaimNotice();
                   EVENTS.execute(() -> {
                       AgentServer s = srv();
@@ -7747,7 +7770,7 @@ jobs:
                */
               @Override
               public void reclaim() {
-                  Context c = app;
+                  final Context c = app;
                   if (c == null) return;
                   AgentService s = AgentService.instance;
                   if (s != null && s.hasProjection()) {
@@ -7756,9 +7779,35 @@ jobs:
                   }
                   synchronized (LOCK) {
                       long now = SystemClock.uptimeMillis();
-                      if (now - lastReclaimAt < 3000) return; // pengendali yang menekan berulang tidak membanjiri HP farm
+                      // pengendali yang menekan berulang tidak membanjiri HP farm; "reclaiming" kedaluwarsa agar tidak macet selamanya
+                      long gap = now - lastReclaimAt;
+                      if (reclaiming) {
+                          if (gap < 20000 || (AgentActivity.reclaimRunning && gap < 80000)) return;
+                      } else if (gap < 3000) {
+                          return;
+                      }
                       lastReclaimAt = now;
+                      reclaiming = true;
                   }
+                  // Aplikasi yang memakai tangkap layar (mis. Macrorify) merebutnya kembali selama masih hidup, jadi matikan dulu.
+                  String pkg = stopPkg(c);
+                  String label = stopEnabled(c) ? appLabel(c, pkg) : null;
+                  AgentAccess a = AgentAccess.instance;
+                  if (label != null && a != null) {
+                      progress("Mematikan " + label + " di HP itu...");
+                      final String lb = label;
+                      a.forceStop(pkg, label, (ok, msg) -> {
+                          progress(ok ? lb + " dimatikan. Membuka dialog izin tangkap layar..."
+                                  : "Gagal mematikan " + lb + " (" + msg + "). Tetap mencoba ambil layar...");
+                          doReclaim(c);
+                      });
+                  } else {
+                      if (label != null) progress("Aksesibilitas CFM Agen belum aktif di HP itu: " + label + " tidak bisa dimatikan otomatis");
+                      doReclaim(c);
+                  }
+              }
+
+              private static void doReclaim(Context c) {
                   armAutoAccept();
                   progress("Membuka dialog izin tangkap layar di HP itu...");
                   try {
@@ -7768,6 +7817,61 @@ jobs:
                   // aplikasi lain" diberikan). Bila layar belum juga dibagikan, pemberitahuan dimunculkan sebagai cadangan.
                   MAIN.removeCallbacks(NOTICE_LATER);
                   MAIN.postDelayed(NOTICE_LATER, 3500);
+              }
+
+              /** Rangkaian "Ambil layar" selesai (layar tiba, menyerah, atau dibatalkan). */
+              static void reclaimDone() {
+                  reclaiming = false;
+              }
+
+              static boolean reclaimBusy() {
+                  return reclaiming;
+              }
+
+              /** Catatan langkah "matikan aplikasi": disimpan untuk diagnosa dan, saat Ambil layar berjalan, diteruskan ke pengendali. */
+              static void stopNote(String msg) {
+                  if (msg == null || msg.equals(stopDiag)) return;
+                  stopDiag = msg;
+                  if (reclaiming) progress("Mematikan aplikasi: " + msg);
+              }
+
+              /** Aplikasi yang tidak boleh dimatikan: aplikasi ini, Pengaturan, SystemUI, dan peluncur (layar utama). */
+              static boolean protectedPkg(Context c, String pkg) {
+                  if (pkg == null || pkg.isEmpty()) return true;
+                  if (pkg.equals(c.getPackageName()) || pkg.equals("android") || pkg.equals("com.android.settings")
+                          || pkg.equals("com.android.systemui") || pkg.equals("com.google.android.packageinstaller")
+                          || pkg.equals("com.android.packageinstaller")) return true;
+                  try {
+                      android.content.pm.PackageManager pm = c.getPackageManager();
+                      android.content.pm.ResolveInfo home = pm.resolveActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+                              android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+                      if (home != null && home.activityInfo != null && pkg.equals(home.activityInfo.packageName)) return true;
+                  } catch (Throwable ignored) { }
+                  return false;
+              }
+
+              // ---------- pengaturan "matikan aplikasi saat Ambil layar" ----------
+              static boolean stopEnabled(Context c) {
+                  return AgentService.prefs(c).getBoolean("stopOn", true);
+              }
+
+              static String stopPkg(Context c) {
+                  return AgentService.prefs(c).getString("stopPkg", DEFAULT_STOP_PKG);
+              }
+
+              static void setStop(Context c, boolean on, String pkg) {
+                  AgentService.prefs(c).edit().putBoolean("stopOn", on).putString("stopPkg", pkg == null ? "" : pkg).apply();
+              }
+
+              /** Nama aplikasi bila terpasang (dan bukan aplikasi ini sendiri), selain itu null. */
+              static String appLabel(Context c, String pkg) {
+                  if (protectedPkg(c, pkg)) return null;
+                  try {
+                      android.content.pm.PackageManager pm = c.getPackageManager();
+                      return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+                  } catch (Throwable e) {
+                      return null;
+                  }
               }
 
               /** Token acak yang hanya diketahui aplikasi ini: AgentActivity (yang diekspor) hanya menuruti permintaan ambil-layar yang membawanya. */
@@ -8424,6 +8528,7 @@ jobs:
               public boolean onUnbind(Intent intent) {
                   if (instance == this) instance = null;
                   main.removeCallbacks(acceptPoll);
+                  if (stopJob != null) stopJob.finish(false, "layanan Aksesibilitas terputus");
                   AgentHost.stopIfIdle();
                   return super.onUnbind(intent);
               }
@@ -8431,6 +8536,8 @@ jobs:
               @Override
               public void onDestroy() {
                   if (instance == this) instance = null;
+                  main.removeCallbacks(acceptPoll);
+                  if (stopJob != null) stopJob.finish(false, "layanan Aksesibilitas terputus");
                   AgentHost.stopIfIdle();
                   super.onDestroy();
               }
@@ -8587,6 +8694,7 @@ jobs:
               /** action 0 turun, 1 angkat, 2 geser. nx, ny: 0..65535 relatif ke layar penuh. */
               void touch(int action, int nx, int ny) {
                   if (Build.VERSION.SDK_INT < 24) return; // dispatchGesture baru ada di Android 7
+                  if (stopActive) return; // sedang mematikan aplikasi lain lewat Info aplikasi: jangan salah ketuk
                   DisplayMetrics dm = realMetrics();
                   float x = nx / 65535f * (dm.widthPixels - 1);
                   float y = ny / 65535f * (dm.heightPixels - 1);
@@ -8684,9 +8792,273 @@ jobs:
                   }
               }
 
+              // ---------- matikan aplikasi lain (Paksa berhenti lewat Info aplikasi) ----------
+              interface StopDone {
+                  void done(boolean ok, String msg);
+              }
+
+              /** true selama tugas "matikan aplikasi" berjalan: sentuhan/tombol dari pengendali ditahan agar tidak salah ketuk di Info aplikasi. */
+              static volatile boolean stopActive;
+
+              private StopJob stopJob;
+
+              /**
+               * Matikan paksa aplikasi pkg dengan membuka Pengaturan > Info aplikasi lalu menekan "Paksa berhenti" dan
+               * konfirmasinya, seperti dilakukan tangan. Dipakai sebelum "Ambil layar" karena Android hanya mengizinkan satu
+               * tangkap layar: aplikasi seperti Macrorify merebutnya kembali selama masih hidup. cb dipanggil di thread utama
+               * (tidak dipanggil bila tugas ini digantikan tugas lain).
+               */
+              void forceStop(final String pkg, final String label, final StopDone cb) {
+                  main.post(() -> {
+                      if (stopJob != null) stopJob.cancelQuiet();
+                      stopJob = new StopJob(pkg, label, cb);
+                      stopJob.begin();
+                  });
+              }
+
+              private static final String[] FORCE_WORDS = {"paksa berhenti", "force stop", "berhenti paksa", "hentikan paksa", "force close", "paksa hentikan"};
+              private static final String[] NOT_FORCE_DIALOG = {"uninstall", "hapus instal", "copot", "disable", "nonaktif", "clear", "hapus data", "hapus cache", "kosongkan"};
+
+              private static boolean isForceWord(CharSequence t) {
+                  if (t == null) return false;
+                  String x = t.toString().trim().toLowerCase(java.util.Locale.ROOT);
+                  for (String w : FORCE_WORDS) if (x.equals(w)) return true;
+                  return false;
+              }
+
+              private void collectText(AccessibilityNodeInfo n, StringBuilder sb, int depth, int[] budget) {
+                  if (n == null || depth > 14 || budget[0]-- <= 0) return;
+                  CharSequence t = n.getText();
+                  if (t != null) sb.append(t).append('\n');
+                  CharSequence d = n.getContentDescription();
+                  if (d != null) sb.append(d).append('\n');
+                  int c = n.getChildCount();
+                  for (int i = 0; i < c; i++) collectText(n.getChild(i), sb, depth + 1, budget);
+              }
+
+              private static boolean containsAny(String text, String[] words) {
+                  for (String w : words) if (text.contains(w)) return true;
+                  return false;
+              }
+
+              /** Paket aplikasi Pengaturan yang melayani Info aplikasi (bisa berbeda di MIUI dan lainnya); null = tebak dari nama paket. */
+              private String settingsPackage(String pkg) {
+                  try {
+                      Intent i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:" + pkg));
+                      android.content.pm.ResolveInfo ri = getPackageManager().resolveActivity(i, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+                      if (ri != null && ri.activityInfo != null && ri.activityInfo.packageName != null
+                              && !"android".equals(ri.activityInfo.packageName)) return ri.activityInfo.packageName;
+                  } catch (Throwable ignored) { }
+                  return null;
+              }
+
+              private final class StopJob implements Runnable {
+                  final String pkg, label, settingsPkg;
+                  final StopDone cb;
+                  final long deadline = SystemClock.uptimeMillis() + 14000;
+                  long lastLaunch, lastClick, lastSeen, forceClickedAt, disabledSince, noButtonSince;
+                  int launches;
+                  boolean everSawPage, finished;
+                  String why = "";
+
+                  StopJob(String pkg, String label, StopDone cb) {
+                      this.pkg = pkg;
+                      this.label = label;
+                      this.cb = cb;
+                      this.settingsPkg = settingsPackage(pkg);
+                  }
+
+                  boolean isSettings(CharSequence pk) {
+                      if (pk == null) return false;
+                      String x = pk.toString();
+                      if (settingsPkg != null) return x.equals(settingsPkg);
+                      return x.toLowerCase(java.util.Locale.ROOT).contains("settings");
+                  }
+
+                  void begin() {
+                      stopActive = true;
+                      AgentHost.stopNote("Membuka Info aplikasi " + label + "...");
+                      launch();
+                      main.postDelayed(this, 350);
+                  }
+
+                  void launch() {
+                      lastLaunch = SystemClock.uptimeMillis();
+                      launches++;
+                      try {
+                          Intent i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:" + pkg));
+                          // CLEAR_TASK: selalu mulai dari halaman Info aplikasi yang bersih, sehingga satu Kembali cukup untuk menutupnya
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                          startActivity(i);
+                      } catch (Throwable e) {
+                          why = "Info aplikasi gagal dibuka: " + e.getClass().getSimpleName();
+                          AgentHost.stopNote(why);
+                      }
+                  }
+
+                  @Override
+                  public void run() {
+                      if (finished) return;
+                      long now = SystemClock.uptimeMillis();
+                      if (now > deadline) {
+                          finish(false, everSawPage ? (why.isEmpty() ? "tombol Paksa berhenti tidak ditemukan atau tidak merespons" : why)
+                                  : "Info aplikasi tidak terbuka (izinkan Tampil di atas aplikasi lain, atau layar terhalang)");
+                          return;
+                      }
+                      int r;
+                      try {
+                          r = inspect(now);
+                      } catch (Throwable e) {
+                          r = 0;
+                      }
+                      if (r == 2) {
+                          finish(true, "dimatikan");
+                          return;
+                      }
+                      // Info aplikasi hilang (mis. bot menekan Kembali): buka lagi
+                      if (r == 0 && now - Math.max(lastLaunch, lastSeen) > 1300 && launches < 8) launch();
+                      main.postDelayed(this, 300);
+                  }
+
+                  /** 0 = belum terlihat, 1 = halaman terlihat / sudah menekan sesuatu, 2 = selesai (aplikasi sudah mati). */
+                  private int inspect(long now) {
+                      java.util.List<AccessibilityNodeInfo> roots = new ArrayList<>();
+                      java.util.List<android.view.accessibility.AccessibilityWindowInfo> ws = null;
+                      try { ws = getWindows(); } catch (Throwable ignored) { }
+                      if (ws != null) {
+                          for (android.view.accessibility.AccessibilityWindowInfo w : ws) {
+                              AccessibilityNodeInfo r = null;
+                              try { r = w.getRoot(); } catch (Throwable ignored) { }
+                              if (r != null) roots.add(r);
+                          }
+                      }
+                      if (roots.isEmpty()) {
+                          AccessibilityNodeInfo r = getRootInActiveWindow();
+                          if (r != null) roots.add(r);
+                      }
+                      // 1) dialog (AlertDialog dengan tombol button1) milik Pengaturan
+                      for (AccessibilityNodeInfo root : roots) {
+                          if (!isSettings(root.getPackageName())) continue;
+                          java.util.List<AccessibilityNodeInfo> b1 = null;
+                          try { b1 = root.findAccessibilityNodeInfosByViewId("android:id/button1"); } catch (Throwable ignored) { }
+                          if (b1 == null || b1.isEmpty()) continue;
+                          lastSeen = now;
+                          StringBuilder sb = new StringBuilder();
+                          collectText(root, sb, 0, new int[]{200});
+                          String text = sb.toString().toLowerCase(java.util.Locale.ROOT);
+                          boolean bad = containsAny(text, NOT_FORCE_DIALOG);
+                          // konfirmasi hanya dalam beberapa detik setelah KITA menekan Paksa berhenti, dan bukan dialog Copot/Nonaktifkan/Hapus
+                          boolean mine = forceClickedAt > 0 && now - forceClickedAt < 7000;
+                          if (now - lastClick < 500) return 1;
+                          if (mine && !bad && b1.get(0).isEnabled()) {
+                              lastClick = now;
+                              b1.get(0).performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                              AgentHost.stopNote("Mengonfirmasi Paksa berhenti...");
+                          } else if (bad) {
+                              lastClick = now;
+                              performGlobalAction(GLOBAL_ACTION_BACK); // dialog yang berbahaya: tutup
+                              AgentHost.stopNote("Dialog lain muncul, ditutup");
+                          }
+                          return 1;
+                      }
+                      // 2) halaman Info aplikasi milik aplikasi target
+                      for (AccessibilityNodeInfo root : roots) {
+                          if (!isSettings(root.getPackageName())) continue;
+                          if (!showsLabel(root)) continue;
+                          AccessibilityNodeInfo btn = null;
+                          for (String w : FORCE_WORDS) {
+                              java.util.List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(w);
+                              if (l == null) continue;
+                              for (AccessibilityNodeInfo n : l) {
+                                  if (!isForceWord(n.getText()) && !isForceWord(n.getContentDescription())) continue;
+                                  AccessibilityNodeInfo c = clickableSelfOrParent(n);
+                                  if (c != null) {
+                                      btn = c;
+                                      break;
+                                  }
+                              }
+                              if (btn != null) break;
+                          }
+                          everSawPage = true;
+                          lastSeen = now;
+                          if (btn == null) {
+                              if (noButtonSince == 0) noButtonSince = now;
+                              why = "halaman terbuka tetapi tombol Paksa berhenti tidak ditemukan";
+                              AgentHost.stopNote(why);
+                              if (now - noButtonSince > 2500 && launches < 8) { // mungkin belum selesai dimuat: buka ulang
+                                  noButtonSince = 0;
+                                  launch();
+                              }
+                              return 1;
+                          }
+                          noButtonSince = 0;
+                          if (!btn.isEnabled()) {
+                              // tombol mati = aplikasi tidak berjalan; harus tetap mati sebentar agar tidak tertipu keadaan sesaat
+                              if (disabledSince == 0) disabledSince = now;
+                              if (now - disabledSince >= 700) return 2;
+                              return 1;
+                          }
+                          disabledSince = 0;
+                          if (now - lastClick >= 600) {
+                              lastClick = now;
+                              forceClickedAt = now;
+                              btn.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                              AgentHost.stopNote("Menekan Paksa berhenti...");
+                          }
+                          return 1;
+                      }
+                      return 0;
+                  }
+
+                  /** Halaman ini memang milik aplikasi target: ada teks yang sama persis dengan nama aplikasinya. */
+                  private boolean showsLabel(AccessibilityNodeInfo root) {
+                      java.util.List<AccessibilityNodeInfo> mine = root.findAccessibilityNodeInfosByText(label);
+                      if (mine == null) return false;
+                      for (AccessibilityNodeInfo n : mine) {
+                          CharSequence t = n.getText();
+                          if (t != null && label.equalsIgnoreCase(t.toString().trim())) return true;
+                      }
+                      return false;
+                  }
+
+                  /** Berhenti tanpa memanggil cb (tugas diganti tugas lain). */
+                  void cancelQuiet() {
+                      if (finished) return;
+                      finished = true;
+                      main.removeCallbacks(this);
+                      if (stopJob == this) stopJob = null;
+                      stopActive = false;
+                  }
+
+                  void finish(final boolean ok, final String msg) {
+                      if (finished) return;
+                      finished = true;
+                      main.removeCallbacks(this);
+                      if (stopJob == this) stopJob = null;
+                      stopActive = false;
+                      AgentHost.stopNote((ok ? "Berhasil: " : "Gagal: ") + label + " " + msg);
+                      // tutup Info aplikasi (dan dialog yang mungkin masih terbuka bila gagal)
+                      if (everSawPage) {
+                          try { performGlobalAction(GLOBAL_ACTION_BACK); } catch (Throwable ignored) { }
+                          if (!ok) {
+                              main.postDelayed(() -> {
+                                  try { performGlobalAction(GLOBAL_ACTION_BACK); } catch (Throwable ignored) { }
+                              }, 350);
+                          }
+                      }
+                      // beri waktu sistem melepas tangkap layar aplikasi yang baru dimatikan
+                      main.postDelayed(() -> {
+                          try {
+                              if (cb != null) cb.done(ok, msg);
+                          } catch (Throwable ignored) { }
+                      }, ok ? 900 : 700);
+                  }
+              }
+
               // ---------- tombol ----------
               /** @return true bila tombol ini ditangani oleh layanan Aksesibilitas. */
               boolean key(final int code) {
+                  if (stopActive) return true; // lihat touch()
                   final int action;
                   switch (code) {
                       case 3:
@@ -8755,6 +9127,7 @@ jobs:
           import android.content.Context;
           import android.content.Intent;
           import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
           import android.media.projection.MediaProjectionManager;
@@ -8775,6 +9148,9 @@ jobs:
           import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
           import java.util.List;
 
           /**
@@ -8788,12 +9164,15 @@ jobs:
               static final String EXTRA_RECLAIM = "reclaim";
               /** Token rahasia aplikasi ini (AgentHost.reclaimToken): AgentActivity diekspor, jadi aplikasi lain tidak boleh memicu ambil-layar. */
               static final String EXTRA_TOKEN = "rtok";
+              /** true selama layar ini sedang mengurus permintaan Ambil layar (dialog izin, coba ulang). */
+              static volatile boolean reclaimRunning;
 
               private final Handler ui = new Handler(Looper.getMainLooper());
               private TextView accessState, accessNote, shareState, addrTv, pinTv, clientTv, errTv;
               private TextView accessBtn, shareBtn, stopBtn, serverTv;
               private boolean reclaimMode, capturePending, resumed, wantCapture;
-              private TextView overlayNote, overlayBtn, diagTv;
+              private TextView overlayNote, overlayBtn, diagTv, stopTarget, stopDiagTv;
+              private CheckBox stopCb;
               private int attempts;
               private long reclaimDeadline;
 
@@ -8936,6 +9315,29 @@ jobs:
                       add(root, c6, 12);
                   }
 
+                  // matikan aplikasi lain saat Ambil layar
+                  LinearLayout c7 = card("Matikan aplikasi saat Ambil layar");
+                  stopCb = new CheckBox(this);
+                  stopCb.setText("Matikan paksa aplikasi ini sebelum Ambil layar dari HP pengendali");
+                  stopCb.setTextColor(MainActivity.FG);
+                  stopCb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                  stopCb.setChecked(AgentHost.stopEnabled(this));
+                  stopCb.setOnCheckedChangeListener((v, on) -> AgentHost.setStop(AgentActivity.this, on, AgentHost.stopPkg(AgentActivity.this)));
+                  c7.addView(stopCb);
+                  stopTarget = tv("", 14, MainActivity.FG, true);
+                  add(c7, stopTarget, 8);
+                  TextView d7 = tv("Macrorify memakai tangkap layar dan merebutnya kembali selama masih hidup, jadi Ambil layar hanya bisa berhasil "
+                          + "bila Macrorify dimatikan dulu. HP ini membuka Info aplikasi, menekan Paksa berhenti dan konfirmasinya, baru meminta "
+                          + "izin tangkap layar. Butuh Aksesibilitas CFM Agen aktif (langkah 1). Catatan: setelah dimatikan paksa, Android bisa "
+                          + "ikut mematikan layanan Aksesibilitas Macrorify; bila bot tidak mengklik, aktifkan lagi di Pengaturan > Aksesibilitas "
+                          + "lalu jalankan botnya.", 12.5f, MainActivity.DIM, false);
+                  add(c7, d7, 6);
+                  add(c7, button("Pilih aplikasi lain", false, v -> pickStopApp()), 10);
+                  add(c7, button("Coba matikan sekarang", false, v -> testStop()), 8);
+                  stopDiagTv = tv("", 11.5f, MainActivity.DIM, false);
+                  add(c7, stopDiagTv, 6);
+                  add(root, c7, 12);
+
                   // bentrok tangkap layar
                   LinearLayout c5 = card("Dipakai bersama Macrorify atau perekam layar?");
                   TextView d5 = tv("Android hanya mengizinkan SATU aplikasi menangkap layar pada satu waktu. Saat Macrorify (atau perekam layar lain) "
@@ -9001,6 +9403,7 @@ jobs:
                       return;
                   }
                   reclaimMode = true;
+                  reclaimRunning = true;
                   wantCapture = true;
                   attempts = 0;
                   reclaimDeadline = SystemClock.uptimeMillis() + 45000;
@@ -9026,6 +9429,8 @@ jobs:
               private void leave() {
                   if (!reclaimMode) return;
                   reclaimMode = false;
+                  reclaimRunning = false;
+                  AgentHost.reclaimDone();
                   try { moveTaskToBack(true); } catch (Throwable ignored) { }
                   finish();
               }
@@ -9037,6 +9442,16 @@ jobs:
                   if (accessibilityOn()) AgentHost.ensure(this);
                   ui.post(tick);
                   if (wantCapture) ui.post(this::runWanted);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (reclaimMode) {
+                      reclaimMode = false;
+                      reclaimRunning = false;
+                      AgentHost.reclaimDone();
+                  }
+                  super.onDestroy();
               }
 
               @Override
@@ -9082,6 +9497,15 @@ jobs:
                   shareBtn.setBackground(live ? box(MainActivity.CARD2, 14, MainActivity.LINE) : box(MainActivity.ACC, 14, 0));
                   shareBtn.setTextColor(live ? MainActivity.FG : 0xFF0B0E14);
                   stopBtn.setVisibility(standby ? View.VISIBLE : View.GONE);
+                  String stp = AgentHost.stopPkg(this);
+                  String stl = AgentHost.appLabel(this, stp);
+                  boolean stOn = stopCb.isChecked();
+                  stopTarget.setText(stl != null ? "Aplikasi: " + stl + (stOn ? "" : " (nonaktif)")
+                          : (stp.isEmpty() ? "Belum ada aplikasi dipilih" : "Tidak terpasang atau dilindungi: " + stp));
+                  stopTarget.setTextColor(stl != null ? (stOn ? MainActivity.OK : MainActivity.DIM) : MainActivity.WARN);
+                  String sd = AgentHost.stopDiag;
+                  stopDiagTv.setText(sd == null || sd.isEmpty() ? "" : "Terakhir: " + sd);
+                  stopDiagTv.setVisibility(sd == null || sd.isEmpty() ? View.GONE : View.VISIBLE);
                   String dg = AgentHost.acceptDiag;
                   boolean showDiag = Build.VERSION.SDK_INT <= 33 && !live && dg != null && !dg.isEmpty();
                   diagTv.setText(showDiag ? "Klik otomatis dialog izin: " + dg : "");
@@ -9133,6 +9557,60 @@ jobs:
                   } catch (Throwable e) {
                       Toast.makeText(this, "Tidak bisa membuka pengaturan Aksesibilitas", Toast.LENGTH_LONG).show();
                   }
+              }
+
+              /** Daftar aplikasi berikon peluncur untuk dipilih sebagai aplikasi yang dimatikan sebelum Ambil layar. */
+              private void pickStopApp() {
+                  PackageManager pm = getPackageManager();
+                  Intent q = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+                  List<ResolveInfo> l = pm.queryIntentActivities(q, 0);
+                  final List<String[]> apps = new ArrayList<>(); // {label, package}
+                  for (ResolveInfo ri : l) {
+                      String pkg = ri.activityInfo.packageName;
+                      if (AgentHost.protectedPkg(this, pkg)) continue;
+                      boolean dup = false;
+                      for (String[] a : apps) if (a[1].equals(pkg)) dup = true;
+                      if (!dup) apps.add(new String[]{String.valueOf(ri.loadLabel(pm)), pkg});
+                  }
+                  Collections.sort(apps, new Comparator<String[]>() {
+                      @Override
+                      public int compare(String[] a, String[] b) {
+                          return a[0].compareToIgnoreCase(b[0]);
+                      }
+                  });
+                  final String[] names = new String[apps.size()];
+                  for (int i = 0; i < names.length; i++) names[i] = apps.get(i)[0] + "\n" + apps.get(i)[1];
+                  new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                          .setTitle("Aplikasi yang dimatikan")
+                          .setItems(names, (d, i) -> {
+                              AgentHost.setStop(this, stopCb.isChecked(), apps.get(i)[1]);
+                              refresh();
+                          })
+                          .setNegativeButton("Batal", null)
+                          .show();
+              }
+
+              private void testStop() {
+                  AgentAccess a = AgentAccess.instance;
+                  String pkg = AgentHost.stopPkg(this);
+                  String label = AgentHost.appLabel(this, pkg);
+                  if (a == null) {
+                      Toast.makeText(this, "Aktifkan Aksesibilitas CFM Agen dulu (langkah 1)", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  if (AgentHost.reclaimBusy()) {
+                      Toast.makeText(this, "Sedang menjalankan Ambil layar dari pengendali, coba lagi sebentar", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  if (label == null) {
+                      Toast.makeText(this, "Aplikasi belum dipilih atau tidak terpasang", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  Toast.makeText(this, "Mematikan " + label + "...", Toast.LENGTH_SHORT).show();
+                  a.forceStop(pkg, label, (ok, msg) -> {
+                      Toast.makeText(AgentActivity.this, ok ? label + " dimatikan" : "Gagal: " + msg, Toast.LENGTH_LONG).show();
+                      refresh();
+                  });
               }
 
               private void openOverlaySettings() {
@@ -9269,7 +9747,7 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
+              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
               android:canPerformGestures="true"
               android:canRetrieveWindowContent="true"
               android:description="@string/agent_access_desc"
